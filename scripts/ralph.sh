@@ -168,6 +168,13 @@ format_duration() {
   fi
 }
 
+# fmt_epoch <epoch> <formato> — formata um timestamp unix.
+# O date do BSD (macOS) nao tem -d; o do GNU nao aceita epoch em -r (espera um
+# arquivo). Tenta a forma BSD e cai para a GNU.
+fmt_epoch() {
+  date -r "$1" "$2" 2>/dev/null || date -d "@$1" "$2"
+}
+
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
@@ -684,7 +691,7 @@ wait_for_reset() {
     if [ "$wait_secs" -lt "$LIMIT_BUFFER" ]; then
       wait_secs=$LIMIT_BUFFER
     fi
-    warn "Limite de uso atingido. Reset previsto para $(date -d "@$epoch" '+%d/%m %H:%M:%S')."
+    warn "Limite de uso atingido. Reset previsto para $(fmt_epoch "$epoch" '+%d/%m %H:%M:%S')."
   else
     wait_secs=$LIMIT_WAIT_DEFAULT
     warn "Limite de uso atingido. Sem horario de reset no output; aguardando fallback."
@@ -716,6 +723,9 @@ run_engine() {
   export RALPH_ENGINE="$ENGINE"
   export RALPH_PHASE_MAX_ATTEMPTS="$MAX_CYCLES"
 
+  # ${arr[@]+"${arr[@]}"}: no bash 3.2 (default do macOS) expandir um array vazio
+  # sob `set -u` e "unbound variable" e mata a sessao. O codex sem
+  # RALPH_VERIFY_MODEL cai exatamente nesse caso.
   local model_args=()
   if [[ "$mode" == "verify" ]] && [ -n "$VERIFY_MODEL" ]; then
     model_args=(--model "$VERIFY_MODEL")
@@ -726,7 +736,7 @@ run_engine() {
 
     if [[ "$ENGINE" == "codex" ]]; then
       if [[ "$mode" == "verify" ]]; then
-        codex exec --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
+        codex exec --sandbox read-only ${model_args[@]+"${model_args[@]}"} - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
       else
         codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
       fi
@@ -735,7 +745,7 @@ run_engine() {
       # consome o stream de quem chamou (ex: o manifest do loop de fases).
       if [[ "$mode" == "verify" ]]; then
         env -u CLAUDECODE claude --dangerously-skip-permissions \
-          "${model_args[@]}" \
+          ${model_args[@]+"${model_args[@]}"} \
           -p "$(cat "$prompt_file")" \
           --allowedTools "Read,Glob,Grep" \
           --output-format text < /dev/null 2>&1 | tee "$log_file" || rc=$?
@@ -878,8 +888,16 @@ gate3_independent_verify() {
   prompt_file=$(build_verify_prompt "$phase_file" "$cycle")
   run_engine "$prompt_file" "$verify_log" verify || true
 
+  # O log e stream bruto do CLI: o codex exec ecoa a mensagem final mais de uma
+  # vez por turno, entao a mesma task aparece repetida. Deduplica pelo indice
+  # (ultimo veredito emitido vence) e reordena por <n>; sem isso a contagem de
+  # cobertura estoura e reprova fase completa.
   local task_lines
-  task_lines=$(sed 's/^[[:space:]]*//' "$verify_log" | grep -E '^TASK [0-9]+: (DONE|INCOMPLETE)' || true)
+  task_lines=$(sed 's/^[[:space:]]*//' "$verify_log" \
+    | grep -E '^TASK [0-9]+: (DONE|INCOMPLETE)' \
+    | awk '{ n = $2; sub(/:$/, "", n); verdict[n] = $0 }
+           END { for (n in verdict) printf "%d\t%s\n", n, verdict[n] }' \
+    | sort -n | cut -f2- || true)
 
   local parsed
   parsed=$(printf '%s' "$task_lines" | grep -c . || true)
@@ -1140,8 +1158,8 @@ main() {
   fi
 
   echo ""
-  log "Inicio: $(date -d "@$start_time" '+%d/%m/%Y %H:%M:%S')"
-  log "Fim:    $(date -d "@$end_time" '+%d/%m/%Y %H:%M:%S')"
+  log "Inicio: $(fmt_epoch "$start_time" '+%d/%m/%Y %H:%M:%S')"
+  log "Fim:    $(fmt_epoch "$end_time" '+%d/%m/%Y %H:%M:%S')"
   log "Duracao total: $(format_duration "$total_duration")"
   echo ""
 

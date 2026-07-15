@@ -110,17 +110,36 @@ if [ "$verify" -eq 1 ]; then
   implemented=0
   compgen -G "src/impl-*.txt" > /dev/null 2>&1 && implemented=1
 
+  verdicts=""
   if [ "$implemented" -eq 0 ]; then
-    for i in $(seq 1 "$tasks"); do echo "TASK $i: INCOMPLETE — nenhum codigo encontrado"; done
+    for i in $(seq 1 "$tasks"); do verdicts+="TASK $i: INCOMPLETE — nenhum codigo encontrado"$'\n'; done
+  elif [ "$scenario" = "verify-incomplete-once" ] && [ "$n" -eq 1 ]; then
+    verdicts+="TASK 1: INCOMPLETE — o arquivo nao foi criado"$'\n'
+    for i in $(seq 2 "$tasks"); do verdicts+="TASK $i: DONE"$'\n'; done
+  else
+    for i in $(seq 1 "$tasks"); do verdicts+="TASK $i: DONE"$'\n'; done
+  fi
+
+  # O verificador revisa o proprio veredito num eco posterior: o gate 3 tem que
+  # ficar com o ultimo, nao com o primeiro.
+  if [ "$scenario" = "codex-echo-revised" ]; then
+    printf '%s' "$verdicts"
+    printf 'hook: Stop Completed\n'
+    echo "TASK 1: INCOMPLETE — revisado no ultimo eco"
+    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
     exit 0
   fi
 
-  if [ "$scenario" = "verify-incomplete-once" ] && [ "$n" -eq 1 ]; then
-    echo "TASK 1: INCOMPLETE — o arquivo nao foi criado"
-    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
-  else
-    for i in $(seq 1 "$tasks"); do echo "TASK $i: DONE"; done
-  fi
+  # codex exec ecoa a mensagem final mais de uma vez por turno: o mesmo bloco de
+  # vereditos reaparece no log, com ruido do CLI no meio. codex-echo reproduz
+  # isso; o gate 3 tem que contar tasks distintas, nao linhas.
+  echoes=1
+  [ "$scenario" = "codex-echo" ] && echoes=3
+
+  for _ in $(seq 1 "$echoes"); do
+    [ "$echoes" -gt 1 ] && printf 'hook: Stop Completed\ntokens used\n46.025\n'
+    printf '%s' "$verdicts"
+  done
   exit 0
 fi
 
@@ -649,6 +668,36 @@ if case_enabled laravel-no-sail; then
   run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
   assert_contains "$d/out.log" "comando de teste (detectado): composer test" "sem sail -> composer test"
   assert_not_contains "$d/out.log" "Sail" "nao mencionou Sail"
+fi
+
+# ---------------------------------------------------------------------------
+# 22. codex ecoa os vereditos varias vezes -> gate 3 conta tasks, nao linhas
+# ---------------------------------------------------------------------------
+if case_enabled codex-echo; then
+  header "22. eco duplicado do codex nao infla a cobertura do gate 3"
+  d=$(new_case codex-echo)
+  rc=$(run_ralph "$d" codex-echo --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 3 "$(commits "$d")" "1 commit por fase"
+  # a fixture so prova algo se de fato duplicar: 2 tasks x 3 ecos = 6 linhas
+  assert_eq 6 "$(grep -cE '^TASK [0-9]+: (DONE|INCOMPLETE)' "$d/repo/.phases/logs/phase-01.verify-1.log")" \
+    "o log do verificador tem os vereditos repetidos"
+  assert_contains "$d/out.log" "Gate 3 — 2/2 tasks confirmadas" "cobertura contada por task distinta"
+  assert_not_contains "$d/out.log" "cobertura incompleta" "eco nao reprova fase completa"
+  assert_contains "$d/repo/.phases/.progress" "phase-01.md" "fase marcada como concluida"
+fi
+
+# ---------------------------------------------------------------------------
+# 23. Veredito revisado num eco posterior -> vale o ultimo, nao o primeiro
+# ---------------------------------------------------------------------------
+if case_enabled verify-dedupe-last; then
+  header "23. eco com veredito revisado -> vale o ultimo"
+  d=$(new_case verify-dedupe-last)
+  rc=$(run_ralph "$d" codex-echo-revised --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 1 "$rc" "exit 1 (o DONE do primeiro eco nao pode mascarar a revisao)"
+  assert_eq 1 "$(commits "$d")" "nenhum commit criado"
+  assert_contains "$d/out.log" "Gate 3 vermelho" "gate 3 reprovou pelo ultimo veredito"
+  assert_contains "$d/out.log" "revisado no ultimo eco" "causa cita a task revisada"
 fi
 
 # ---------------------------------------------------------------------------
