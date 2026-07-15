@@ -487,7 +487,12 @@ if case_enabled bad-format; then
   d=$(new_case bad-format)
   (
     cd "$d/repo" || exit 1
-    sed -i 's/^## Phase 2: Feature$/## Phase Two — Feature/' .spec/init/project-phases.md
+    # sed -i sem sufixo e GNU-ism: no BSD (macOS) ele consome o script como
+    # sufixo de backup, falha e deixa o arquivo intacto — a fixture nunca ficava
+    # torta e o caso passava por engano.
+    sed 's/^## Phase 2: Feature$/## Phase Two — Feature/' .spec/init/project-phases.md > phases.tmp
+    mv phases.tmp .spec/init/project-phases.md
+    grep -q '^## Phase Two' .spec/init/project-phases.md || { echo "fixture nao ficou torta"; exit 1; }
     git add -A && git commit -q -m "chore: heading torto"
   )
   rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh")
