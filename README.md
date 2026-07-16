@@ -134,6 +134,14 @@ Core rules:
 - **Preserves third-party blocks** — `<tag>...</tag>` regions (e.g. Laravel Boost) are re-appended verbatim on regeneration.
 - `+id` / `-id` filters generate only a subset (e.g. `/ai-context +AGENTS +architecture`).
 
+## Stack profiles
+
+The harness is stack-agnostic through **profiles**: data files under `profiles/` (`laravel.md`, `wordpress.md`, `generic.md`) that tell the `init:*` commands where already-done work lives, what the foundation phases mean, and what the data-model artifact documents for that stack. Supporting a new stack means adding one profile file — no command changes.
+
+`/init:project-description` detects the stack, derives a **Stack Profile** block (profile, `data_layer`, `test_cmd`, `run_cmd`), and confirms it with you in the interview. Downstream commands and `scripts/ralph.sh` read that block — declared once, never asked again.
+
+For WordPress (`data_layer: cpt-taxonomy`), `init:database-schema` documents the **content model** (post types, taxonomies, meta, options) instead of a SQL schema; DBML tables appear only for real custom tables, and zero custom tables is valid.
+
 ## `scripts/ralph.sh` — execution orchestrator
 
 Reads a phase document, splits it on the `## Phase N: <title>` heading, and feeds each phase to a **fresh** Codex CLI or Claude Code session, with no human interaction from start to finish.
@@ -169,7 +177,7 @@ Green gates with a clean tree → the phase was already implemented at HEAD: mar
 
 ### Test command detection (gate 2)
 
-First rule that resolves wins: `--test-cmd` → `RALPH_TEST_CMD` → manifest detection (Laravel Sail → `composer test` → `php artisan test` → `npm test` → `pytest` → `go test ./...` → `cargo test`) → nothing resolved = gate 2 skipped with a loud warning (gate 3 holds the line alone).
+First rule that resolves wins: `--test-cmd` → `RALPH_TEST_CMD` → the `test_cmd` row of the **Stack Profile** in `.spec/init/project-description.md` → manifest detection (Laravel Sail → `composer test` → `php artisan test` → `vendor/bin/phpunit` when `phpunit.xml(.dist)` exists → `npm test` → `pytest` → `go test ./...` → `cargo test`) → nothing resolved = gate 2 skipped with a loud warning (gate 3 holds the line alone).
 
 Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail test`); stopped containers abort at preflight — every gate 2 would fail and burn fix cycles for nothing.
 
@@ -238,6 +246,8 @@ commands/
   ai-context.md                /ai-context (context tree router)
 agents/                        specifier, clarifier, planner,
                                ai-context-{inspector,core,docs}
+profiles/                      stack profiles read by the init:* commands
+                               (laravel, wordpress, generic)
 scripts/
   ralph.sh                     phase-by-phase execution orchestrator
   test-ralph.sh                red/green suite for ralph with a mock engine

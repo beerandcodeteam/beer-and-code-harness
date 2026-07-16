@@ -110,17 +110,36 @@ if [ "$verify" -eq 1 ]; then
   implemented=0
   compgen -G "src/impl-*.txt" > /dev/null 2>&1 && implemented=1
 
+  verdicts=""
   if [ "$implemented" -eq 0 ]; then
-    for i in $(seq 1 "$tasks"); do echo "TASK $i: INCOMPLETE — nenhum codigo encontrado"; done
+    for i in $(seq 1 "$tasks"); do verdicts+="TASK $i: INCOMPLETE — nenhum codigo encontrado"$'\n'; done
+  elif [ "$scenario" = "verify-incomplete-once" ] && [ "$n" -eq 1 ]; then
+    verdicts+="TASK 1: INCOMPLETE — o arquivo nao foi criado"$'\n'
+    for i in $(seq 2 "$tasks"); do verdicts+="TASK $i: DONE"$'\n'; done
+  else
+    for i in $(seq 1 "$tasks"); do verdicts+="TASK $i: DONE"$'\n'; done
+  fi
+
+  # O verificador revisa o proprio veredito num eco posterior: o gate 3 tem que
+  # ficar com o ultimo, nao com o primeiro.
+  if [ "$scenario" = "codex-echo-revised" ]; then
+    printf '%s' "$verdicts"
+    printf 'hook: Stop Completed\n'
+    echo "TASK 1: INCOMPLETE — revisado no ultimo eco"
+    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
     exit 0
   fi
 
-  if [ "$scenario" = "verify-incomplete-once" ] && [ "$n" -eq 1 ]; then
-    echo "TASK 1: INCOMPLETE — o arquivo nao foi criado"
-    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
-  else
-    for i in $(seq 1 "$tasks"); do echo "TASK $i: DONE"; done
-  fi
+  # codex exec ecoa a mensagem final mais de uma vez por turno: o mesmo bloco de
+  # vereditos reaparece no log, com ruido do CLI no meio. codex-echo reproduz
+  # isso; o gate 3 tem que contar tasks distintas, nao linhas.
+  echoes=1
+  [ "$scenario" = "codex-echo" ] && echoes=3
+
+  for _ in $(seq 1 "$echoes"); do
+    [ "$echoes" -gt 1 ] && printf 'hook: Stop Completed\ntokens used\n46.025\n'
+    printf '%s' "$verdicts"
+  done
   exit 0
 fi
 
@@ -257,6 +276,26 @@ fi
 exit 0
 SAILMOCK
   chmod +x "$repo/vendor/bin/sail"
+}
+
+# Fixture de project-description com bloco Stack Profile. $2 = valor de test_cmd
+# (celula crua da tabela: "\`cmd\`" ou "—").
+make_spec_description() {
+  local repo="$1" cell="$2"
+  cat > "$repo/.spec/init/project-description.md" <<EOF
+# Test Project — Project Description
+
+## Tech Stack
+
+### Stack Profile
+
+| key        | value |
+|------------|-------|
+| profile    | generic |
+| data_layer | none |
+| test_cmd   | $cell |
+| run_cmd    | — |
+EOF
 }
 
 # new_case <nome> -> ecoa o diretorio do repo fixture
@@ -468,7 +507,12 @@ if case_enabled bad-format; then
   d=$(new_case bad-format)
   (
     cd "$d/repo" || exit 1
-    sed -i 's/^## Phase 2: Feature$/## Phase Two — Feature/' .spec/init/project-phases.md
+    # sed -i sem sufixo e GNU-ism: no BSD (macOS) ele consome o script como
+    # sufixo de backup, falha e deixa o arquivo intacto — a fixture nunca ficava
+    # torta e o caso passava por engano.
+    sed 's/^## Phase 2: Feature$/## Phase Two — Feature/' .spec/init/project-phases.md > phases.tmp
+    mv phases.tmp .spec/init/project-phases.md
+    grep -q '^## Phase Two' .spec/init/project-phases.md || { echo "fixture nao ficou torta"; exit 1; }
     git add -A && git commit -q -m "chore: heading torto"
   )
   rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh")
@@ -649,6 +693,96 @@ if case_enabled laravel-no-sail; then
   run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
   assert_contains "$d/out.log" "comando de teste (detectado): composer test" "sem sail -> composer test"
   assert_not_contains "$d/out.log" "Sail" "nao mencionou Sail"
+fi
+
+# ---------------------------------------------------------------------------
+# 17. test_cmd do Stack Profile (project-description) -> usado no gate 2
+# ---------------------------------------------------------------------------
+if case_enabled spec-test-cmd; then
+  header "17. Stack Profile test_cmd -> gate 2 usa o comando declarado"
+  d=$(new_case spec-test-cmd)
+  make_spec_description "$d/repo" "\`$d/test.sh\`"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: spec"
+  rc=$(run_ralph "$d" ok --engine claude)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "comando de teste (Stack Profile" "fonte reportada: Stack Profile"
+  assert_eq 2 "$(cat "$d/state/test_calls")" "a suite declarada rodou 1x por fase"
+  # o agente recebe o comando exato no prompt (mesma garantia dos outros modos)
+  assert_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "$d/test.sh" "prompt informa o comando de teste"
+fi
+
+# ---------------------------------------------------------------------------
+# 18. --test-cmd sobrepoe o test_cmd do Stack Profile
+# ---------------------------------------------------------------------------
+if case_enabled spec-test-cmd-precedence; then
+  header "18. --test-cmd sobrepoe o Stack Profile"
+  d=$(new_case spec-test-cmd-precedence)
+  make_spec_description "$d/repo" '`/bin/false`'   # se o spec ganhasse, gate 2 falharia
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: spec"
+  rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "exit 0 (flag venceu o spec)"
+  assert_contains "$d/out.log" "comando de teste (--test-cmd)" "fonte reportada: --test-cmd"
+  assert_not_contains "$d/out.log" "comando de teste (Stack Profile" "spec nao foi usado"
+fi
+
+# ---------------------------------------------------------------------------
+# 19. test_cmd "—" no Stack Profile -> cai na deteccao (e sem manifest, avisa)
+# ---------------------------------------------------------------------------
+if case_enabled spec-test-cmd-dash; then
+  header "19. Stack Profile com test_cmd — -> nao vira comando"
+  d=$(new_case spec-test-cmd-dash)
+  make_spec_description "$d/repo" "—"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: spec"
+  run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
+  assert_contains "$d/out.log" "Gate 2 DESABILITADO" "— nao resolve comando"
+  assert_not_contains "$d/out.log" "comando de teste (Stack Profile" "spec vazio ignorado"
+fi
+
+# ---------------------------------------------------------------------------
+# 20. WordPress/PHP: phpunit.xml + vendor/bin/phpunit -> detectado no gate 2
+# ---------------------------------------------------------------------------
+if case_enabled wp-phpunit; then
+  header "20. phpunit.xml + vendor/bin/phpunit -> deteccao"
+  d=$(new_case wp-phpunit)
+  touch "$d/repo/phpunit.xml"
+  mkdir -p "$d/repo/vendor/bin"
+  printf '#!/usr/bin/env bash\nexec "$MOCK_TEST_CMD"\n' > "$d/repo/vendor/bin/phpunit"
+  chmod +x "$d/repo/vendor/bin/phpunit"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: wp"
+  rc=$(run_ralph "$d" ok --engine claude)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "comando de teste (detectado): vendor/bin/phpunit" "detectou phpunit local"
+  assert_eq 2 "$(cat "$d/state/test_calls")" "a suite rodou 1x por fase, via phpunit"
+fi
+
+# ---------------------------------------------------------------------------
+# 22. codex ecoa os vereditos varias vezes -> gate 3 conta tasks, nao linhas
+# ---------------------------------------------------------------------------
+if case_enabled codex-echo; then
+  header "22. eco duplicado do codex nao infla a cobertura do gate 3"
+  d=$(new_case codex-echo)
+  rc=$(run_ralph "$d" codex-echo --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 3 "$(commits "$d")" "1 commit por fase"
+  # a fixture so prova algo se de fato duplicar: 2 tasks x 3 ecos = 6 linhas
+  assert_eq 6 "$(grep -cE '^TASK [0-9]+: (DONE|INCOMPLETE)' "$d/repo/.phases/logs/phase-01.verify-1.log")" \
+    "o log do verificador tem os vereditos repetidos"
+  assert_contains "$d/out.log" "Gate 3 — 2/2 tasks confirmadas" "cobertura contada por task distinta"
+  assert_not_contains "$d/out.log" "cobertura incompleta" "eco nao reprova fase completa"
+  assert_contains "$d/repo/.phases/.progress" "phase-01.md" "fase marcada como concluida"
+fi
+
+# ---------------------------------------------------------------------------
+# 23. Veredito revisado num eco posterior -> vale o ultimo, nao o primeiro
+# ---------------------------------------------------------------------------
+if case_enabled verify-dedupe-last; then
+  header "23. eco com veredito revisado -> vale o ultimo"
+  d=$(new_case verify-dedupe-last)
+  rc=$(run_ralph "$d" codex-echo-revised --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 1 "$rc" "exit 1 (o DONE do primeiro eco nao pode mascarar a revisao)"
+  assert_eq 1 "$(commits "$d")" "nenhum commit criado"
+  assert_contains "$d/out.log" "Gate 3 vermelho" "gate 3 reprovou pelo ultimo veredito"
+  assert_contains "$d/out.log" "revisado no ultimo eco" "causa cita a task revisada"
 fi
 
 # ---------------------------------------------------------------------------

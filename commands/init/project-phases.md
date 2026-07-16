@@ -32,7 +32,7 @@ Read the existing spec and produce a single document at **`.spec/init/project-ph
 
 Before asking anything, read the inputs in this order:
 
-- **`.spec/init/project-description.md`** — scope, tech stack, core workflows.
+- **`.spec/init/project-description.md`** — scope, tech stack, core workflows. Note its **Stack Profile** table (`profile`, `data_layer`): it selects the conventions for codebase inspection (step 2) and the foundation rules below. Load the profile's details with `cat "${CLAUDE_PLUGIN_ROOT}/profiles/<profile>.md"` (missing file or unset variable → the inline per-profile defaults below; no Stack Profile block at all → `generic`).
 - **`.spec/init/user-stories.md`** — the stories, acceptance criteria, priorities.
 - **`.spec/init/database-schema.md`** — every table, lookup, pivot, relationship.
 - **`.spec/init/design/`** — if this directory exists, it holds the **UI/design specs** (mockups, screen definitions, component references, images). Read it. Every task that builds a screen or component **must** point at its design reference, and its implementation must be **faithful to the proposed design**. `.spec/init/design/` is always a **manual artifact**: the developer creates and populates it; no `init:*` command writes there. Its absence is never an error.
@@ -77,11 +77,13 @@ Any output → warn the developer ("input changed after this artifact was genera
 
 ### 2. Inspect the codebase to detect what is already done
 
-Scan the project so you can mark completed work:
+Scan the project so you can mark completed work. Follow the **inspect** section of the stack profile loaded in step 1; without a profile file, use these defaults for the declared `profile`:
 
-- Migrations (`database/migrations/`), models (`app/Models/`), seeders/factories.
-- Frontend components, pages/screens, routes.
-- Existing tests (`tests/`), controllers, services, form requests, policies.
+- **laravel** — migrations (`database/migrations/`), models (`app/Models/`), seeders/factories, controllers, services, form requests, policies.
+- **wordpress** — theme/plugin entry files (`style.css` header, main plugin file, `functions.php`), `register_post_type` / `register_taxonomy` / meta registrations (native or ACF), template hierarchy files, blocks (`block.json`), enqueued assets, hooks/filters, REST routes.
+- **generic** (or none declared) — the data layer (migrations, ORM entities, schema files), routes/controllers/handlers, frontend components, pages/screens.
+
+In every profile, also scan existing tests (`tests/`, `spec/`, `__tests__/`).
 
 For each task you define, check whether the code already satisfies it. If it does, mark it `[x]`; otherwise `[ ]`. When partially done, mark `[ ]` and note in the task what remains.
 
@@ -102,8 +104,8 @@ Use `AskUserQuestion` for discrete decisions with clear options. Ask real open q
 
 Order the phases so that **foundation work precedes feature flows**. The early phases build the base the rest stands on:
 
-1. **Database foundation** — all migrations and lookup-table seeders from the schema.
-2. **Models & relationships** — every model, with **all relationships wired up front** (belongsTo, hasMany, belongsToMany, etc.), casts, fillables, soft deletes. Do not defer relationships to later feature phases — the models come out of the foundation phase relationship-complete.
+1. **Data foundation** — the stack profile's data layer, complete: all migrations and lookup-table seeders (`migrations-orm` / `schema-file`), or the whole content-model registration — post types, taxonomies, meta fields, options, custom tables (`cpt-taxonomy`).
+2. **Entities & relationships** — every entity with **all relationships declared up front**, in the idiom of the stack's data layer (e.g. Eloquent's belongsTo/hasMany/belongsToMany with casts and soft deletes; WordPress CPT↔taxonomy bindings and registered meta; the detected ORM's associations). Do not defer relationships to later feature phases — entities come out of the foundation phase relationship-complete.
 3. **Frontend foundation** — the base UI: design-system components, layout, shared/reusable components referenced by the design specs.
 
 Only **after** the foundation is in place do the phases start implementing the **project flows** (auth, then each feature area / core workflow, feature by feature).
@@ -225,9 +227,14 @@ done
 for t in $(grep -E '^Table [a-z0-9_]+ \{' .spec/init/database-schema.md | awk '{print $2}' | sort -u); do
   grep -qw "$t" "$F" || echo "table not covered: $t"
 done
+# coverage: every content type declared in the schema's Content Model (cpt-taxonomy
+# stacks) appears in >=1 task (loop must print nothing; no-op on DBML-only schemas)
+for c in $(grep -E '^#### [a-z_]+: [a-z0-9_-]+' .spec/init/database-schema.md | awk '{print $3}' | sort -u); do
+  grep -qw "$c" "$F" || echo "content type not covered: $c"
+done
 ```
 
-The two coverage loops are the enforcement of "cover everything": a story with no `**Traces:**` hit or a schema table mentioned nowhere in the plan means work was left unplanned. Fix by adding the missing tasks (or asking the developer) — never by deleting the story or the table from the upstream docs to silence the check.
+The coverage loops are the enforcement of "cover everything": a story with no `**Traces:**` hit, or a schema table / content type mentioned nowhere in the plan, means work was left unplanned. Fix by adding the missing tasks (or asking the developer) — never by deleting the story or the table from the upstream docs to silence the check.
 
 ### 6. Close out
 

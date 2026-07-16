@@ -34,10 +34,19 @@ Before asking anything, inspect the project so you don't ask what you can detect
 
 - Manifests / lockfiles: `composer.json`, `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `Gemfile`, `pom.xml`, `*.csproj`, etc.
 - Framework markers: `artisan`, `manage.py`, `next.config.*`, `nuxt.config.*`, `vite.config.*`, `docker-compose.yml`, `Dockerfile`.
+- WordPress markers: `style.css` with a `Theme Name:` header, a root `*.php` file with a `Plugin Name:` header, `wp-content/`, `wp-config.php`.
 - Config/env: `.env.example`, CI files, test runner config.
 - Existing docs: `README*`, any files already under `.spec/`.
 
 Read enough to name the stack with real versions. If the directory is empty or pre-code, note that and derive the stack from the developer's stated intent instead (still confirm it).
+
+From what you detected, derive the **Stack Profile** (written in step 3 and consumed by every downstream command and by `scripts/ralph.sh`):
+
+- `profile` — the stack's profile slug. Pick the matching file in the plugin's `profiles/` directory (`ls "${CLAUDE_PLUGIN_ROOT}/profiles/"` — e.g. `laravel`, `wordpress`); anything without a dedicated file is `generic`.
+- `data_layer` — how the project persists data: `migrations-orm` (migrations + ORM models), `cpt-taxonomy` (WordPress-style content types), `schema-file` (e.g. `schema.prisma`), or `none`.
+- `test_cmd` / `run_cmd` — the exact commands to run the test suite and the dev environment from the repo root, non-interactively. `—` when the project has none.
+
+**Confirm the derived profile with the developer in the interview** — especially `test_cmd`, which `scripts/ralph.sh` executes as gate 2.
 
 ### If the target file already exists (re-run)
 
@@ -46,6 +55,7 @@ Re-running this command must **update** the existing document, never rebuild it 
 - Read the existing `.spec/init/project-description.md` **before** interviewing. Every decision recorded in it is source of truth.
 - Interview only about **deltas**: new gaps, new scope, contradictions between the doc and what you detected in the environment. Never re-ask what the document already answers.
 - Update via **Edit**, not a full rewrite. Preserve the numbering of `## Core Workflows` (`### 1.`, `### 2.` …): new workflows take the next number at the end; never renumber existing ones — downstream artifacts reference them by number in their coverage tables.
+- A **Stack Profile** row the developer edited by hand (e.g. a custom `test_cmd`) is a decision — never overwrite it from re-detection without explicit confirmation. If the file predates the Stack Profile block, add it (derive + confirm as in step 1).
 - A section, workflow, or concept the developer deleted stays deleted — restore it only if the developer explicitly confirms.
 
 ### 2. Interview to close gaps
@@ -80,6 +90,15 @@ Write to `.spec/init/project-description.md` (create the `.spec/init/` directori
 
 <A table (Layer | Technology) or grouped bullets, whichever fits. Use real detected versions. One row/line per meaningful layer: backend, frontend, database, testing, dev env, tooling, integrations.>
 
+### Stack Profile
+
+| key        | value |
+|------------|-------|
+| profile    | <laravel · wordpress · generic — a file in the plugin's profiles/ dir, else generic> |
+| data_layer | <migrations-orm · cpt-taxonomy · schema-file · none> |
+| test_cmd   | <exact command in backticks, or —> |
+| run_cmd    | <exact command in backticks, or —> |
+
 ## Core Workflows
 
 ### 1. <Workflow Name>
@@ -94,6 +113,7 @@ Rules for the document:
 
 - **Title** = project name + `— Project Description`.
 - **Overview** carries the "what & why"; **Key Concepts** is the domain glossary; **Tech Stack** is concrete and detected; **Core Workflows** is the numbered list of main flows.
+- **Stack Profile** is a machine-read contract: downstream `init:*` commands select conventions by `profile` and `data_layer`, and `scripts/ralph.sh` greps the `test_cmd` row for its gate 2. Keep the four keys, one per row, exactly as named. `test_cmd`/`run_cmd` hold a single runnable command (backticks) or `—` — commands containing `|` can't live in the table; declare those via `ralph.sh --test-cmd` instead and leave `—` here.
 - Prefer specific numbers, limits, and rules over vague description. If the domain has quantities (counts, tiers, scoring), state them.
 - Keep every claim traceable to something the developer confirmed or you detected. No invented features.
 - If gaps remain unresolved, add a short `## Open Questions` section at the end listing them. Otherwise omit it.
@@ -109,6 +129,10 @@ head -1 "$F" | grep -qE '^# .+ — Project Description$'
 grep -Fq '## Overview' "$F"
 grep -Fq '### Key Concepts' "$F"
 grep -Fq '## Tech Stack' "$F"
+grep -Fq '### Stack Profile' "$F"
+grep -qE '^\| *profile *\|' "$F"      # Stack Profile keys — machine-read
+grep -qE '^\| *data_layer *\|' "$F"
+grep -qE '^\| *test_cmd *\|' "$F"
 grep -Fq '## Core Workflows' "$F"
 [ "$(grep -cE '^### [0-9]+\. ' "$F")" -ge 1 ]      # >=1 numbered workflow
 [ "$(grep -cE '^- \*\*[^*]+:\*\*' "$F")" -ge 1 ]   # >=1 key concept entry

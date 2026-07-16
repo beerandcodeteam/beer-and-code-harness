@@ -132,6 +132,14 @@ Regras centrais:
 - **Preserva blocos de terceiros** — regiões `<tag>...</tag>` (ex.: Laravel Boost) são re-anexadas verbatim na regeneração.
 - Filtros `+id` / `-id` geram só um subconjunto (ex.: `/ai-context +AGENTS +architecture`).
 
+## Perfis de stack
+
+O harness é agnóstico de stack por meio de **perfis**: arquivos de dados em `profiles/` (`laravel.md`, `wordpress.md`, `generic.md`) que dizem aos comandos `init:*` onde vive o trabalho já feito, o que as fases de fundação significam e o que o artefato de modelo de dados documenta naquela stack. Suportar uma stack nova é adicionar um arquivo de perfil — nenhum comando muda.
+
+O `/init:project-description` detecta a stack, deriva um bloco **Stack Profile** (profile, `data_layer`, `test_cmd`, `run_cmd`) e o confirma com você na entrevista. Os comandos seguintes e o `scripts/ralph.sh` leem esse bloco — declarado uma vez, nunca perguntado de novo.
+
+Para WordPress (`data_layer: cpt-taxonomy`), o `init:database-schema` documenta o **modelo de conteúdo** (post types, taxonomias, meta, options) em vez de um schema SQL; tabelas DBML aparecem só para tabelas custom reais, e zero tabelas custom é válido.
+
 ## `scripts/ralph.sh` — orquestrador de execução
 
 Lê um documento de fases, quebra pelo heading `## Phase N: <título>` e alimenta cada fase a uma sessão **nova** do Codex CLI ou Claude Code, sem interação humana, do início ao fim.
@@ -165,7 +173,7 @@ Gates verdes com árvore limpa → fase já estava implementada em HEAD: marcada
 
 ### Detecção do comando de teste (gate 2)
 
-Primeira regra que resolver: `--test-cmd` → `RALPH_TEST_CMD` → detecção por manifest (Laravel Sail → `composer test` → `php artisan test` → `npm test` → `pytest` → `go test ./...` → `cargo test`) → nada resolvido = gate 2 pulado com aviso alto (gate 3 segura sozinho).
+Primeira regra que resolver: `--test-cmd` → `RALPH_TEST_CMD` → a linha `test_cmd` do **Stack Profile** em `.spec/init/project-description.md` → detecção por manifest (Laravel Sail → `composer test` → `php artisan test` → `vendor/bin/phpunit` quando existe `phpunit.xml(.dist)` → `npm test` → `pytest` → `go test ./...` → `cargo test`) → nada resolvido = gate 2 pulado com aviso alto (gate 3 segura sozinho).
 
 Projeto Laravel Sail: a suite roda **dentro do container** (`vendor/bin/sail test`); containers parados abortam no preflight — todo gate 2 falharia e queimaria ciclos à toa.
 
@@ -234,6 +242,8 @@ commands/
   ai-context.md                /ai-context (roteador da árvore de contexto)
 agents/                        specifier, clarifier, planner,
                                ai-context-{inspector,core,docs}
+profiles/                      perfis de stack lidos pelos comandos init:*
+                               (laravel, wordpress, generic)
 scripts/
   ralph.sh                     orquestrador de execução por fases
   test-ralph.sh                suite red/green do ralph com engine mock

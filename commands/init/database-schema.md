@@ -23,6 +23,8 @@ Read the existing project description and user stories, then produce a single do
 3. Declares **relationships** (foreign keys) and the **lookup tables** that back every categorical field.
 4. Follows the **conventions of the detected stack** (framework/ORM from the project description) and the universal DB guidelines below.
 
+**Content-type stacks** (`data_layer: cpt-taxonomy` in the Stack Profile — WordPress and similar CMS stacks): the artifact documents the **content model** instead of a SQL schema. Entities become post types / taxonomies / options groups with their meta fields in a `## Content Model` section; DBML `Table` blocks are written only for real custom tables (`$wpdb`-style), and **zero custom tables is a valid schema**. Everything else in this command — inputs, stamps, interview, traceability, self-checks — applies unchanged.
+
 ## Process
 
 ### 1. Read the source of truth first
@@ -31,7 +33,7 @@ Before asking anything, read **`.spec/init/project-description.md`** and **`.spe
 
 - If either file is missing, stop and tell the developer to run `init:project-description` and/or `init:user-stories` first.
 - Extract: the core concepts (the nouns → tables), the workflows and stories (the fields, states, and relationships), the user types (auth/roles), and any limits or numbers stated (→ column constraints).
-- Extract the **framework and ORM** from the project description's Tech Stack section — they drive the naming conventions below. Confirm against the codebase manifest (`composer.json`, `package.json`, `pyproject.toml`, `go.mod`, `Gemfile`, …) when one exists.
+- Extract the **framework and ORM** from the project description's Tech Stack section, and `profile` / `data_layer` from its **Stack Profile** table — they drive the naming conventions below and select the content-model branch (`cpt-taxonomy`). Confirm against the codebase manifest (`composer.json`, `package.json`, `pyproject.toml`, `go.mod`, `Gemfile`, …) when one exists.
 - Also scan any other files already under `.spec/` for schema decisions already made, and inspect the project for an existing schema (migrations directory, ORM models/entities, `schema.prisma`, `*.sql` files) so you extend rather than contradict what's there.
 
 Match the **language** of the project description for prose and comments (keep table/column identifiers in English, snake_case).
@@ -94,6 +96,28 @@ Write to `.spec/init/database-schema.md` (create the `.spec/init/` directories i
 
 <1–2 paragraphs: the data model at a glance — the main entities and how they connect. Bold the key entities. Note the conventions in force (detected framework/ORM, lookup tables for enums, soft deletes where used).>
 
+## Content Model
+
+<Only for `data_layer: cpt-taxonomy` — omit this section entirely otherwise. One `####` entry per post type, taxonomy, and options group, using exactly these heading shapes so downstream coverage checks can parse them:>
+
+#### post_type: <slug>
+
+<Labels, hierarchical?, supports, visibility. Then the meta fields:>
+
+| meta key | type | required | notes |
+|----------|------|----------|-------|
+| <key>    | <string/int/bool/…> | <yes/no> | <rules, defaults, limits> |
+
+<Taxonomies attached to this post type.>
+
+#### taxonomy: <slug>
+
+<Object types it attaches to, hierarchical?, seeded terms if categorical.>
+
+#### options: <group_slug>
+
+<The settings fields: key, type, default.>
+
 ## Schema (DBML)
 
 ```dbml
@@ -141,7 +165,8 @@ Rules for the document:
 - **Title** = project name + `— Database Schema`.
 - **Line 3** is the machine-owned **input stamp**: `<!-- inputs: project-description.md@sha256:<12 chars> user-stories.md@sha256:<12 chars> -->`, each checksum being `sha256sum <file> | cut -c1-12` over the files as read in step 1. Refresh it on **every** run, including re-run Edits — downstream commands use it to detect drift. Never preserve a stale stamp as a "developer edit".
 - The DBML must be valid: every `ref` points at a real `table.column`; every foreign key column exists on its table.
-- Keep every table traceable to a core concept, workflow, or story. No invented entities — if you need one to make a relationship work, note why.
+- **Content-type stacks** (`data_layer: cpt-taxonomy`): the `## Content Model` section is required and its `####` headings must keep the `post_type:` / `taxonomy:` / `options:` shapes — `project-phases` parses them for coverage. The DBML block holds only real custom tables and may hold none.
+- Keep every table **and content type** traceable to a core concept, workflow, or story. No invented entities — if you need one to make a relationship work, note why.
 - If gaps remain unresolved, add a short `## Open Questions` section at the end. Otherwise omit it.
 
 ## DB Guidelines
@@ -164,6 +189,7 @@ When no framework/ORM is detected, use this default profile:
   - Instead of a `status` string/enum column, create a `statuses` table (`id`, `name`, …) and reference it as `status_id` (foreign key).
   - The lookup table includes `id`, `name`, and optionally `slug`, `description`, `is_active`, and timestamps as needed.
   - Applies to **all** categorical/enumerable fields: statuses, types, categories, priorities, levels, domain roles, etc.
+- **Content-type stacks** (`data_layer: cpt-taxonomy`): the same rule maps to the platform's primitives — a categorical field becomes a **taxonomy** (queryable, admin-editable, seeded terms listed under `## Lookup Table Seeds`) or a constrained meta/options field, never a free string scattered through templates.
 
 ### File / Image Uploads (universal — any stack)
 
@@ -203,7 +229,14 @@ grep -q '^```dbml' "$F"
 grep -Fq '## Relationships' "$F"
 grep -Fq '## Lookup Table Seeds' "$F"
 grep -Fq '## Notes & Conventions' "$F"
-[ "$(grep -cE '^Table [a-z0-9_]+ \{' "$F")" -ge 1 ]     # >=1 table declared
+# >=1 table declared — except content-type stacks (data_layer: cpt-taxonomy),
+# where >=1 parseable Content Model entry replaces it and the DBML may be empty
+if grep -qE '^\| *data_layer *\| *`?cpt-taxonomy`? *\|' .spec/init/project-description.md; then
+  grep -Fq '## Content Model' "$F"
+  [ "$(grep -cE '^#### (post_type|taxonomy|options): [a-z0-9_-]+' "$F")" -ge 1 ]
+else
+  [ "$(grep -cE '^Table [a-z0-9_]+ \{' "$F")" -ge 1 ]
+fi
 ! grep -iqE '^ +[a-z0-9_]+ +enum' "$F"                  # house rule: no enum columns
 # every ref target must be a declared Table (loop must print nothing)
 for t in $(grep -oE 'ref: *[<>-]+ *[a-z0-9_]+\.' "$F" | grep -oE '[a-z0-9_]+\.' | tr -d '.' | sort -u); do
@@ -216,7 +249,7 @@ done
 After writing, report:
 
 - The path written.
-- A count of tables broken down as: domain tables, lookup tables, pivots.
+- A count of tables broken down as: domain tables, lookup tables, pivots. Content-type stacks: also post types, taxonomies, options groups.
 - The coverage table from step 4 (Key Concept | Table(s)) — every concept persisted or noted as not persisted.
 - Self-checks: all green — list any check that initially failed and how it was fixed (Red → Green).
 - Any open questions still needing the developer's decision.
