@@ -173,7 +173,7 @@ Gates verdes com árvore limpa → fase já estava implementada em HEAD: marcada
 
 ### Detecção do comando de teste (gate 2)
 
-Primeira regra que resolver: `--test-cmd` → `RALPH_TEST_CMD` → detecção por manifest (Laravel Sail → `composer test` → `php artisan test` → `npm test` → `pytest` → `go test ./...` → `cargo test`) → nada resolvido = gate 2 pulado com aviso alto (gate 3 segura sozinho).
+Primeira regra que resolver: `--test-cmd` → `RALPH_TEST_CMD` → a linha `test_cmd` do **Stack Profile** em `.spec/init/project-description.md` → detecção por manifest (Laravel Sail → `composer test` → `php artisan test` → `vendor/bin/phpunit` quando existe `phpunit.xml(.dist)` → `npm test` → `pytest` → `go test ./...` → `cargo test`) → nada resolvido = gate 2 pulado com aviso alto (gate 3 segura sozinho).
 
 Projeto Laravel Sail: a suite roda **dentro do container** (`vendor/bin/sail test`); containers parados abortam no preflight — todo gate 2 falharia e queimaria ciclos à toa.
 

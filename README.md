@@ -177,7 +177,7 @@ Green gates with a clean tree → the phase was already implemented at HEAD: mar
 
 ### Test command detection (gate 2)
 
-First rule that resolves wins: `--test-cmd` → `RALPH_TEST_CMD` → manifest detection (Laravel Sail → `composer test` → `php artisan test` → `npm test` → `pytest` → `go test ./...` → `cargo test`) → nothing resolved = gate 2 skipped with a loud warning (gate 3 holds the line alone).
+First rule that resolves wins: `--test-cmd` → `RALPH_TEST_CMD` → the `test_cmd` row of the **Stack Profile** in `.spec/init/project-description.md` → manifest detection (Laravel Sail → `composer test` → `php artisan test` → `vendor/bin/phpunit` when `phpunit.xml(.dist)` exists → `npm test` → `pytest` → `go test ./...` → `cargo test`) → nothing resolved = gate 2 skipped with a loud warning (gate 3 holds the line alone).
 
 Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail test`); stopped containers abort at preflight — every gate 2 would fail and burn fix cycles for nothing.
 

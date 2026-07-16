@@ -62,15 +62,17 @@
 # Comando de teste (gate 2), primeira regra que resolver:
 #   1. --test-cmd "<cmd>"
 #   2. RALPH_TEST_CMD
-#   3. deteccao por manifest:
+#   3. linha test_cmd do Stack Profile em .spec/init/project-description.md
+#   4. deteccao por manifest:
 #        Laravel Sail (artisan + vendor/bin/sail)  -> vendor/bin/sail test
 #        composer.json com scripts.test            -> composer test
 #        artisan                                   -> php artisan test
+#        phpunit.xml(.dist) + vendor/bin/phpunit   -> vendor/bin/phpunit
 #        package.json com scripts.test             -> npm test
 #        pytest.ini / pyproject [tool.pytest]      -> pytest
 #        go.mod                                    -> go test ./...
 #        Cargo.toml                                -> cargo test
-#   4. nada resolvido -> aviso alto + gate 2 pulado (o gate 3 segura sozinho)
+#   5. nada resolvido -> aviso alto + gate 2 pulado (o gate 3 segura sozinho)
 #
 # Laravel Sail: a suite roda dentro do container, entao Sail tem precedencia
 # sobre `composer test`. Containers parados -> abort no preflight (todo gate 2
@@ -245,6 +247,21 @@ detect_sail() {
   return 1
 }
 
+# test_cmd declarado no Stack Profile do project-description (linha de tabela
+# markdown `| test_cmd | `cmd` |`, escrita pelo /init:project-description).
+# Ecoa o comando; retorna 1 sem bloco, sem arquivo ou com valor vazio/"—".
+spec_test_cmd() {
+  local spec=".spec/init/project-description.md" line
+  [ -f "$spec" ] || return 1
+  line=$(grep -m1 -E '^\|[[:space:]]*test_cmd[[:space:]]*\|' "$spec") || return 1
+  line="${line#*|}"                       # remove a celula da chave
+  line="${line#*|}"
+  line="${line%|*}"                       # remove o pipe de fechamento
+  line=$(printf '%s' "$line" | sed 's/`//g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+  case "$line" in ''|—|-|–|'N/A'|'n/a') return 1 ;; esac
+  printf '%s\n' "$line"
+}
+
 # Containers de pe? O wrapper do sail imprime "Sail is not running." e sai != 0.
 sail_running() {
   local out rc=0
@@ -301,6 +318,14 @@ resolve_test_cmd() {
     return 0
   fi
 
+  local spec_cmd
+  if spec_cmd=$(spec_test_cmd); then
+    TEST_CMD="$spec_cmd"
+    log "Gate 2 — comando de teste (Stack Profile do project-description): $TEST_CMD"
+    check_sail_running
+    return 0
+  fi
+
   # Sail vem ANTES de composer/npm: num projeto Laravel dockerizado o host nao
   # tem PHP nem acesso ao banco, e `composer test` mentiria como gate.
   if [ -n "$SAIL_BIN" ]; then
@@ -309,6 +334,9 @@ resolve_test_cmd() {
     TEST_CMD="composer test"
   elif [ -f artisan ]; then
     TEST_CMD="php artisan test"
+  # WordPress/PHP sem script composer: phpunit.xml na raiz + binario instalado.
+  elif { [ -f phpunit.xml ] || [ -f phpunit.xml.dist ]; } && [ -x vendor/bin/phpunit ]; then
+    TEST_CMD="vendor/bin/phpunit"
   elif [ -f package.json ] && grep -qE '"test"[[:space:]]*:' package.json; then
     TEST_CMD="npm test"
   elif [ -f pytest.ini ] || { [ -f pyproject.toml ] && grep -qF '[tool.pytest' pyproject.toml; }; then
@@ -327,7 +355,7 @@ resolve_test_cmd() {
     if [ "$VERIFY_MODE" = "off" ]; then
       warn "--no-verify tambem desligou o gate 3: NENHUMA validacao mecanica ativa."
     else
-      warn "Passe --test-cmd '<cmd>' ou defina RALPH_TEST_CMD. O gate 3 (verificador) roda em toda fase."
+      warn "Passe --test-cmd '<cmd>', defina RALPH_TEST_CMD, ou declare test_cmd no Stack Profile do .spec/init/project-description.md. O gate 3 (verificador) roda em toda fase."
     fi
   fi
 }

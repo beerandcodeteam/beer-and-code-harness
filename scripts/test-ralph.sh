@@ -278,6 +278,26 @@ SAILMOCK
   chmod +x "$repo/vendor/bin/sail"
 }
 
+# Fixture de project-description com bloco Stack Profile. $2 = valor de test_cmd
+# (celula crua da tabela: "\`cmd\`" ou "—").
+make_spec_description() {
+  local repo="$1" cell="$2"
+  cat > "$repo/.spec/init/project-description.md" <<EOF
+# Test Project — Project Description
+
+## Tech Stack
+
+### Stack Profile
+
+| key        | value |
+|------------|-------|
+| profile    | generic |
+| data_layer | none |
+| test_cmd   | $cell |
+| run_cmd    | — |
+EOF
+}
+
 # new_case <nome> -> ecoa o diretorio do repo fixture
 new_case() {
   local name="$1"
@@ -673,6 +693,66 @@ if case_enabled laravel-no-sail; then
   run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
   assert_contains "$d/out.log" "comando de teste (detectado): composer test" "sem sail -> composer test"
   assert_not_contains "$d/out.log" "Sail" "nao mencionou Sail"
+fi
+
+# ---------------------------------------------------------------------------
+# 17. test_cmd do Stack Profile (project-description) -> usado no gate 2
+# ---------------------------------------------------------------------------
+if case_enabled spec-test-cmd; then
+  header "17. Stack Profile test_cmd -> gate 2 usa o comando declarado"
+  d=$(new_case spec-test-cmd)
+  make_spec_description "$d/repo" "\`$d/test.sh\`"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: spec"
+  rc=$(run_ralph "$d" ok --engine claude)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "comando de teste (Stack Profile" "fonte reportada: Stack Profile"
+  assert_eq 2 "$(cat "$d/state/test_calls")" "a suite declarada rodou 1x por fase"
+  # o agente recebe o comando exato no prompt (mesma garantia dos outros modos)
+  assert_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "$d/test.sh" "prompt informa o comando de teste"
+fi
+
+# ---------------------------------------------------------------------------
+# 18. --test-cmd sobrepoe o test_cmd do Stack Profile
+# ---------------------------------------------------------------------------
+if case_enabled spec-test-cmd-precedence; then
+  header "18. --test-cmd sobrepoe o Stack Profile"
+  d=$(new_case spec-test-cmd-precedence)
+  make_spec_description "$d/repo" '`/bin/false`'   # se o spec ganhasse, gate 2 falharia
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: spec"
+  rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "exit 0 (flag venceu o spec)"
+  assert_contains "$d/out.log" "comando de teste (--test-cmd)" "fonte reportada: --test-cmd"
+  assert_not_contains "$d/out.log" "comando de teste (Stack Profile" "spec nao foi usado"
+fi
+
+# ---------------------------------------------------------------------------
+# 19. test_cmd "—" no Stack Profile -> cai na deteccao (e sem manifest, avisa)
+# ---------------------------------------------------------------------------
+if case_enabled spec-test-cmd-dash; then
+  header "19. Stack Profile com test_cmd — -> nao vira comando"
+  d=$(new_case spec-test-cmd-dash)
+  make_spec_description "$d/repo" "—"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: spec"
+  run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
+  assert_contains "$d/out.log" "Gate 2 DESABILITADO" "— nao resolve comando"
+  assert_not_contains "$d/out.log" "comando de teste (Stack Profile" "spec vazio ignorado"
+fi
+
+# ---------------------------------------------------------------------------
+# 20. WordPress/PHP: phpunit.xml + vendor/bin/phpunit -> detectado no gate 2
+# ---------------------------------------------------------------------------
+if case_enabled wp-phpunit; then
+  header "20. phpunit.xml + vendor/bin/phpunit -> deteccao"
+  d=$(new_case wp-phpunit)
+  touch "$d/repo/phpunit.xml"
+  mkdir -p "$d/repo/vendor/bin"
+  printf '#!/usr/bin/env bash\nexec "$MOCK_TEST_CMD"\n' > "$d/repo/vendor/bin/phpunit"
+  chmod +x "$d/repo/vendor/bin/phpunit"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: wp"
+  rc=$(run_ralph "$d" ok --engine claude)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "comando de teste (detectado): vendor/bin/phpunit" "detectou phpunit local"
+  assert_eq 2 "$(cat "$d/state/test_calls")" "a suite rodou 1x por fase, via phpunit"
 fi
 
 # ---------------------------------------------------------------------------
