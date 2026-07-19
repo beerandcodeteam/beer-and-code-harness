@@ -102,7 +102,9 @@
 
 set -euo pipefail
 
-ENGINE="codex"
+source "$(dirname "$0")/engine_adapter.sh"
+
+ENGINE="$(detect_ai_engine)"
 INPUT_FILE=""
 FROM_PHASE=0
 KEEP_GOING=false
@@ -326,8 +328,8 @@ resolve_test_cmd() {
 }
 
 preflight_checks() {
-  if [[ "$ENGINE" != "codex" && "$ENGINE" != "claude" ]]; then
-    fail "Engine invalida: $ENGINE. Use 'codex' ou 'claude'."
+  if [[ "$ENGINE" != "codex" && "$ENGINE" != "claude" && "$ENGINE" != "agy" ]]; then
+    fail "Engine invalida: $ENGINE. Use 'agy', 'claude' ou 'codex'."
     exit 1
   fi
 
@@ -360,8 +362,10 @@ preflight_checks() {
   if ! command -v "$ENGINE" &> /dev/null; then
     if [[ "$ENGINE" == "codex" ]]; then
       fail "codex CLI nao encontrado. Instale com: npm install -g @openai/codex"
-    else
+    elif [[ "$ENGINE" == "claude" ]]; then
       fail "Claude Code CLI nao encontrado. Instale com: npm install -g @anthropic-ai/claude-code"
+    else
+      fail "Antigravity CLI (agy) nao encontrado."
     fi
     exit 1
   fi
@@ -724,28 +728,7 @@ run_engine() {
   while true; do
     local rc=0
 
-    if [[ "$ENGINE" == "codex" ]]; then
-      if [[ "$mode" == "verify" ]]; then
-        codex exec --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
-      else
-        codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
-      fi
-    else
-      # < /dev/null: claude -p le stdin quando nao e TTY. Sem o redirect ele
-      # consome o stream de quem chamou (ex: o manifest do loop de fases).
-      if [[ "$mode" == "verify" ]]; then
-        env -u CLAUDECODE claude --dangerously-skip-permissions \
-          "${model_args[@]}" \
-          -p "$(cat "$prompt_file")" \
-          --allowedTools "Read,Glob,Grep" \
-          --output-format text < /dev/null 2>&1 | tee "$log_file" || rc=$?
-      else
-        # JSON: o exit code do CLI e sinal fraco; o gate 0 le is_error.
-        env -u CLAUDECODE claude --dangerously-skip-permissions \
-          -p "$(cat "$prompt_file")" \
-          --output-format json < /dev/null 2>&1 | tee "$log_file" || rc=$?
-      fi
-    fi
+    run_ai_prompt "$ENGINE" "$mode" "$prompt_file" "$log_file" "${model_args[@]}" || rc=$?
 
     local reset_epoch
     if reset_epoch=$(detect_usage_limit "$log_file"); then

@@ -1,0 +1,10 @@
+{
+  "name": "bc-harness",
+  "version": "0.2.0",
+  "description": "Beer and Code harness — commands, scripts, and hooks to help developers build robust, scalable, tested, real-world-proven projects.",
+  "author": {
+    "name": "Beer and Code",
+    "email": "administrador@beerandcode.com.br"
+  },
+  "license": "MIT"
+}

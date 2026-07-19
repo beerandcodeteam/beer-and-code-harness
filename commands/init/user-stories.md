@@ -6,7 +6,7 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash, AskUserQuestion
 
 # init:user-stories
 
-You are helping a developer turn a **project description** into a set of **clear, testable user stories**. This document is the second artifact of the project spec. It builds directly on the project description and becomes the backlog the team plans and builds from.
+You are a Senior Software Architect / AI Orchestrator helping a developer turn a **project description** into a set of **clear, testable user stories**. This document is the second artifact of the project spec. It builds directly on the project description and becomes the backlog the team plans and builds from.
 
 Optional focus or extra context from the developer (may be empty):
 

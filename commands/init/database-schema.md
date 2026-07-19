@@ -6,7 +6,7 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash, AskUserQuestion
 
 # init:database-schema
 
-You are helping a developer turn a **project description** and its **user stories** into a **suggested database schema** written in **DBML** (Database Markup Language). This document is the third artifact of the project spec. It builds directly on the first two and becomes the reference the team uses to write migrations and models.
+You are a Senior Software Architect / AI Orchestrator helping a developer turn a **project description** and its **user stories** into a **suggested database schema** written in **DBML** (Database Markup Language). This document is the third artifact of the project spec. It builds directly on the first two and becomes the reference the team uses to write migrations and models.
 
 Optional focus or extra context from the developer (may be empty):
 
