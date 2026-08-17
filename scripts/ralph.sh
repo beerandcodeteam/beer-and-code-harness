@@ -54,7 +54,7 @@
 #      nao escreveu nada (claim "ja implementada"), ciclo de correcao, ou
 #      gate 2 desabilitado. --no-verify / RALPH_VERIFY=off desliga. No engine
 #      claude o verificador usa um modelo barato (RALPH_VERIFY_MODEL, default:
-#      haiku) — e leitura + checklist.
+#      sonnet) — e leitura + checklist.
 #
 # Gates verdes com a arvore limpa => a fase ja estava implementada em HEAD:
 # marcada como feita, sem commit (nao ha o que commitar).
@@ -79,7 +79,7 @@
 # Variaveis de ambiente:
 #   RALPH_TEST_CMD           comando de teste (gate 2); --test-cmd tem prioridade
 #   RALPH_VERIFY             gate 3: always (default) | auto | off
-#   RALPH_VERIFY_MODEL       modelo do verificador (default: haiku no claude)
+#   RALPH_VERIFY_MODEL       modelo do verificador (default: sonnet no claude)
 #   RALPH_MAX_CYCLES         ciclos de correcao por fase (default: 3)
 #   RALPH_MAX_LIMIT_WAITS    esperas consecutivas por limite, por fase (default: 20)
 #   RALPH_LIMIT_WAIT_DEFAULT fallback de espera em segundos (default: 1800)
@@ -354,7 +354,7 @@ preflight_checks() {
   if [ -n "${RALPH_VERIFY_MODEL:-}" ]; then
     VERIFY_MODEL="$RALPH_VERIFY_MODEL"
   elif [[ "$ENGINE" == "claude" ]]; then
-    VERIFY_MODEL="haiku"
+    VERIFY_MODEL="sonnet"
   fi
 
   if ! command -v "$ENGINE" &> /dev/null; then
@@ -622,6 +622,23 @@ Regras:
 - Codigo ausente, TODO, placeholder ou teste faltando => INCOMPLETE.
 - Na duvida, INCOMPLETE.
 
+Execucao (headless — leia com atencao):
+- Voce roda em sessao nao-interativa: o processo MORRE quando este turno acaba.
+  Nao existe turno seguinte, nao existe notificacao de tarefa concluida.
+- NUNCA rode nada em background (`run_in_background`, `&`, `nohup`) nem espere
+  por notificacao de conclusao. O resultado nunca chegara e a fase sera reprovada
+  por falta das linhas TASK.
+- Rode comandos apenas de forma SINCRONA e apenas se forem rapidos (segundos):
+  `grep`, `ls`, `route:list`, `schedule:list`, `test --filter=<Arquivo>`.
+- NAO rode a suite completa (`artisan test` sem filtro): ela leva dezenas de
+  minutos e nao cabe neste gate. Para tasks cujo criterio e "suite verde",
+  verifique pela EXISTENCIA e pelo CONTEUDO dos testes exigidos e pelo log de
+  teste da propria fase, e emita o veredito com base nisso.
+- Emitir as linhas TASK e a ULTIMA coisa que voce faz e e OBRIGATORIO. Terminar o
+  turno sem elas reprova a fase, mesmo que o codigo esteja correto. Se ficou sem
+  evidencia suficiente para alguma task, emita INCOMPLETE para ela — nunca
+  termine o turno anunciando que vai aguardar algo.
+
 ## Fase a verificar
 VERIFY
     cat "$PHASES_DIR/$phase_file"
@@ -638,16 +655,23 @@ VERIFY
 # Retorna 0 quando detecta limite, 1 quando nao ha limite.
 detect_usage_limit() {
   local log_file="$1"
-  local tail_txt pattern epoch
+  local tail_txt pattern epoch human now
 
   # A mensagem de limite sai no FIM da execucao. Olhar o log inteiro faz output
   # de teste do projeto ("429", "Too Many Requests") disparar espera de 30min.
   tail_txt=$(tail -n 20 "$log_file" 2>/dev/null || true)
 
+  # O Claude Code nao tem UMA mensagem de limite. Ja foram vistas:
+  #   "Claude AI usage limit reached|1753362600"          (epoch cru)
+  #   "You've hit your session limit · resets 11:10am"    (horario humano)
+  #   "5-hour limit reached"
+  # O denominador comum e api_error_status 429 no JSON de resultado — casar so
+  # a frase deixa o limite passar por gate 0 e queima todos os ciclos de
+  # correcao em segundos, que e exatamente o que o invariante 4 evita.
   if [[ "$ENGINE" == "claude" ]]; then
-    pattern='usage limit reached'
+    pattern='usage limit reached|hit your (session|usage|[0-9]+-hour) limit|[0-9]+-hour limit reached|"api_error_status"[[:space:]]*:[[:space:]]*429'
   else
-    pattern='rate limit reached|quota exceeded|usage limit reached'
+    pattern='rate limit reached|quota exceeded|usage limit reached|too many requests'
   fi
 
   grep -qiE "$pattern" <<< "$tail_txt" || return 1
@@ -660,6 +684,19 @@ detect_usage_limit() {
       | grep -oE '[0-9]{10,13}' | tail -1 || true)
   fi
 
+  # Horario humano ("resets 11:10am", "resets at 3pm"): resolve para a proxima
+  # ocorrencia. Sem isso o run cai no fallback de 30min mesmo sabendo a hora.
+  if [ -z "$epoch" ]; then
+    human=$(grep -oiE 'resets?[[:space:]]+(at[[:space:]]+)?[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' <<< "$tail_txt" \
+      | grep -oiE '[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' | tail -1 || true)
+    if [ -n "$human" ]; then
+      epoch=$(date -d "$human" +%s 2>/dev/null || true)
+      now=$(date +%s)
+      if [ -n "$epoch" ] && [ "$epoch" -le "$now" ]; then
+        epoch=$(date -d "tomorrow $human" +%s 2>/dev/null || echo "$epoch")
+      fi
+    fi
+  fi
   echo "${epoch:-0}"
   return 0
 }
