@@ -157,7 +157,7 @@ Sem argumento, resolve o input nesta ordem: `.spec/init/project-phases.md` → `
 | 0 | O engine terminou de verdade? | claude: `is_error` no JSON de resultado; codex: exit code |
 | 1 | A sessão escreveu código? | Assinatura da árvore antes/depois. **Sinal, não veredito** — fase já implementada faz o engine (corretamente) não escrever nada; o sinal alimenta a causa do ciclo de correção |
 | 2 | A suite de testes passa? | Rodada **pelo ralph**, fora da sessão do agente — o agente não pode "mentir verde" |
-| 3 | Cada task está de fato no código? | Sessão verificadora independente, read-only, que emite `TASK <n>: DONE/INCOMPLETE` por task. Roda em toda fase por default (`RALPH_VERIFY=always`); no engine claude usa modelo barato (haiku) |
+| 3 | Cada task está de fato no código? | Sessão verificadora independente, read-only, que emite `TASK <n>: DONE/INCOMPLETE` por task. Roda em toda fase por default (`RALPH_VERIFY=always`); no engine claude usa modelo barato (`sonnet`) |
 
 Qualquer gate vermelho → **ciclo de correção**: sessão nova recebe a fase inteira + a causa real da falha (nunca "os testes falharam" genérico). Default: 3 ciclos por fase.
 
@@ -179,12 +179,13 @@ Projeto Laravel Sail: a suite roda **dentro do container** (`vendor/bin/sail tes
 | `--max-cycles N` | Ciclos de correção por fase (default: 3) |
 | `--test-cmd "<cmd>"` | Comando de teste do projeto (gate 2) |
 | `--no-verify` | Desliga o gate 3 |
+| `--dashboard` | Painel ao vivo no terminal (ver abaixo) |
 
 | Variável | Efeito |
 |---|---|
 | `RALPH_TEST_CMD` | Comando de teste (gate 2) |
 | `RALPH_VERIFY` | Gate 3: `always` (default) \| `auto` (economiza: só quando o gate 2 não basta) \| `off` |
-| `RALPH_VERIFY_MODEL` | Modelo do verificador (default no claude: `haiku`) |
+| `RALPH_VERIFY_MODEL` | Modelo do verificador (default no claude: `sonnet`) |
 | `RALPH_MAX_CYCLES` | Ciclos de correção por fase (default: 3) |
 | `RALPH_MAX_LIMIT_WAITS` | Esperas consecutivas por limite de uso, por fase (default: 20) |
 | `RALPH_LIMIT_WAIT_DEFAULT` | Fallback de espera em segundos (default: 1800) |
@@ -197,6 +198,76 @@ Durante cada sessão, o ralph exporta `RALPH_ENGINE`, `RALPH_PHASE_TITLE`, `RALP
 Trabalho interno em `.phases/` (registrado em `.git/info/exclude`, sem tocar o `.gitignore` do projeto): fases quebradas, prompts, logs, manifest e `.progress`. O progresso sobrevive entre execuções, mas só vale para o **mesmo input** (stamp sha256) — documento de fases alterado zera o progresso.
 
 Exit code: `0` = todas as fases verdes; `1` = alguma falhou ou abortou.
+
+## `scripts/ralph-watch.sh` — painel ao vivo
+
+O ralph publica o estado do run em `.phases/state/` **sempre**, com ou sem `--dashboard`. O `ralph-watch.sh` lê esse estado e desenha o painel:
+
+```bash
+./scripts/ralph.sh --engine claude --dashboard   # painel no próprio terminal
+./scripts/ralph-watch.sh /caminho/do/repo        # painel de outro terminal
+```
+
+```
+┌─────────────────── PROGRESSO ───────────────────┐ ┌──────────────── TRABALHO ATUAL ─────────────────┐
+│ Fases  1/2      [███████████░░░░░░░░░░░░]  50%  │ │ Fase:      2 · Interface observável             │
+│ Tasks  1/2      [███████████░░░░░░░░░░░░]  50%  │ │ Ciclo:     1/3    Gate: G2                      │
+└─────────────────────────────────────────────────┘ └─────────────────────────────────────────────────┘
+┌──────┬────────────────────────────────────────────┬────────────────┬───────────┬─────────────────────┐
+│ F1   │ Preparação                                 │ ✓ Concluída    │ 1         │ G0 ✓ G1 ✓ G2 ✓ G3 ✓ │
+│ F2   │ Interface observável                       │ ▶ Em execução  │ 1         │ G0 ✓ G1 ✓ G2 ⋯ G3 · │
+│ T1   │   ↳ renderizar títulos longos              │ ✓ Concluída    │ –         │ –                   │
+│ T2   │   ↳ cobrir falhas de rede com retry        │ ▶ Em execução  │ –         │ –                   │
+└──────┴────────────────────────────────────────────┴────────────────┴───────────┴─────────────────────┘
+```
+
+### De onde vem o progresso por task
+
+Uma fase é **uma** sessão de agente, então o ralph não teria como saber onde a sessão está — a menos que a sessão conte. No engine claude ela conta:
+
+A sessão roda com `--output-format stream-json`, que emite eventos linha a linha **enquanto** trabalha. O ralph lê esse stream e reescreve o progresso em `.phases/state/live.tsv`, de quatro fontes, nesta ordem de precedência:
+
+1. **Marcadores de texto** (fonte primária). O prompt manda o agente escrever, como linha isolada, `RALPH-TASK <n> START` antes de começar o item *n* e `RALPH-TASK <n> DONE` quando ele estiver pronto. É texto puro: **não depende de ferramenta nenhuma** — e isso é o que importa, porque em sessão headless (`claude -p`) as ferramentas de lista de tarefas simplesmente não existem, mesmo que o agente tente carregá-las com `ToolSearch`.
+2. **Lista de tarefas do agente**, quando a sessão tiver uma (`TaskCreate`/`TaskUpdate` ou `TodoWrite`): as transições `in_progress`/`completed` viram progresso.
+3. **Reserva observacional** — sem marcador e sem lista, o ralph deduz pelo que o agente edita. Um plano do `/plan` declara `Arquivos:` em cada item, e é esse casamento (caminho editado ↔ arquivo declarado pela task) que dá a granularidade; sem a declaração, cai no enunciado da task. Ao entrar numa task, as anteriores contam como concluídas — o agente trabalha em ordem, e nem toda task tem arquivo próprio.
+4. **Sinal de vida**: assim que a sessão abre, a task 1 aparece em execução — nunca uma fase inteira parada em "Pendente".
+
+No fim da fase, o **gate 3 tem a palavra final**: o veredito `TASK <n>: DONE/INCOMPLETE` do verificador sobrepõe marcador, lista e dedução. Uma task marcada como pronta que não está no código aparece como `! Incompleta`.
+
+Ou seja: durante a fase o painel mostra a intenção do agente; ao fim da fase mostra a verdade verificada.
+
+No engine **codex** não há stream equivalente — a granularidade fica por fase, e as tasks aparecem como pendentes até o veredito do gate 3.
+
+### Planos grandes: topo fixo e tabela rolante
+
+Com dezenas de tasks a tabela não cabe na tela. O painel então mantém **o topo fixo** (identificação, barras, trabalho atual) e faz a tabela de fases e tasks rolar dentro de uma janela do tamanho do terminal — com barra de rolagem na borda direita e um rodapé dizendo quanto ficou fora:
+
+```
+  ▲ 23 acima · ▼ 9 abaixo · seguindo a fase atual · ↑↓ PgUp/PgDn rolam · f segue a fase
+```
+
+A linha em execução — fase e task — fica **realçada de ponta a ponta**, para ser achada de relance na tabela cheia.
+
+Por padrão a janela **segue a fase corrente**: mostra o bloco da fase inteiro quando ele cabe e centra a task em execução quando não cabe. As teclas abaixo assumem o controle a qualquer momento e valem também com `--dashboard`, com o painel embutido no ralph:
+
+| Tecla | Efeito |
+|---|---|
+| `↑` `↓` ou `k` `j` | Rola uma linha |
+| `PgUp` `PgDn`, `b` ou espaço | Rola uma página |
+| `Home`/`g` e `End`/`G` | Primeira e última linha |
+| `f` | Volta a seguir a fase corrente |
+| `q` | Sai do painel (só no modo avulso; não interrompe o ralph) |
+
+| Opção do watch | Efeito |
+|---|---|
+| `--once` | Desenha um frame e sai (útil em script/CI); dump completo, sem recorte |
+| `--interval N` | Segundos entre frames (default: 1) |
+| `--no-color` | Desliga ANSI |
+| `--color` | Força ANSI mesmo sem terminal (teste, arquivo) |
+| `RALPH_WATCH_COLS` | Fixa a largura, para terminal que não reporta |
+| `RALPH_WATCH_LINES` | Fixa a altura; com `--once` também liga a janela rolante |
+
+Com `--dashboard`, as linhas de log do ralph vão para `.phases/logs/ralph.log` (o painel é dono da tela) e o relatório final é impresso no terminal ao sair. Sem o `ralph-watch.sh` ao lado do `ralph.sh`, o `--dashboard` avisa e segue no modo de log — o `ralph.sh` continua sendo copiável sozinho para outro repositório.
 
 ### Contrato de formato do input
 
@@ -236,6 +307,7 @@ agents/                        specifier, clarifier, planner,
                                ai-context-{inspector,core,docs}
 scripts/
   ralph.sh                     orquestrador de execução por fases
+  ralph-watch.sh               painel ao vivo do run (lê .phases/state/)
   test-ralph.sh                suite red/green do ralph com engine mock
   check-init-drift.sh          guarda contra drift textual das regras
                                duplicadas nos comandos init

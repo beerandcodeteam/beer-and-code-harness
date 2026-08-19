@@ -161,7 +161,7 @@ With no argument, the input resolves in this order: `.spec/init/project-phases.m
 | 0 | Did the engine actually finish? | claude: `is_error` in the result JSON; codex: exit code |
 | 1 | Did the session write code? | Tree signature before/after. **A signal, not a verdict** — an already-implemented phase makes the engine (correctly) write nothing; the signal feeds the fix-cycle cause |
 | 2 | Does the test suite pass? | Run **by ralph itself**, outside the agent session — the agent cannot "fake green" |
-| 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. Runs on every phase by default (`RALPH_VERIFY=always`); on the claude engine it uses a cheap model (haiku) |
+| 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. Runs on every phase by default (`RALPH_VERIFY=always`); on the claude engine it uses a cheap model (`sonnet`) |
 
 Any red gate → **fix cycle**: a fresh session receives the full phase + the real failure cause (never a generic "tests failed"). Default: 3 cycles per phase.
 
@@ -183,12 +183,13 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 | `--max-cycles N` | Fix cycles per phase (default: 3) |
 | `--test-cmd "<cmd>"` | Project test command (gate 2) |
 | `--no-verify` | Disables gate 3 |
+| `--dashboard` | Live panel in the terminal (see below) |
 
 | Variable | Effect |
 |---|---|
 | `RALPH_TEST_CMD` | Test command (gate 2) |
 | `RALPH_VERIFY` | Gate 3: `always` (default) \| `auto` (saves tokens: only when gate 2's verdict isn't enough) \| `off` |
-| `RALPH_VERIFY_MODEL` | Verifier model (claude default: `haiku`) |
+| `RALPH_VERIFY_MODEL` | Verifier model (claude default: `sonnet`) |
 | `RALPH_MAX_CYCLES` | Fix cycles per phase (default: 3) |
 | `RALPH_MAX_LIMIT_WAITS` | Consecutive usage-limit waits, per phase (default: 20) |
 | `RALPH_LIMIT_WAIT_DEFAULT` | Fallback wait in seconds (default: 1800) |
@@ -201,6 +202,76 @@ During each session, ralph exports `RALPH_ENGINE`, `RALPH_PHASE_TITLE`, `RALPH_P
 Internal work lives in `.phases/` (registered in `.git/info/exclude`, without touching the project's `.gitignore`): split phases, prompts, logs, manifest, and `.progress`. Progress survives across runs, but only for the **same input** (sha256 stamp) — a changed phase document resets progress.
 
 Exit code: `0` = all phases green; `1` = some phase failed or aborted.
+
+## `scripts/ralph-watch.sh` — live panel
+
+ralph publishes run state to `.phases/state/` **always**, with or without `--dashboard`. `ralph-watch.sh` reads that state and draws the panel:
+
+```bash
+./scripts/ralph.sh --engine claude --dashboard   # panel in the same terminal
+./scripts/ralph-watch.sh /path/to/repo           # panel from another terminal
+```
+
+```
+┌─────────────────── PROGRESSO ───────────────────┐ ┌──────────────── TRABALHO ATUAL ─────────────────┐
+│ Fases  1/2      [███████████░░░░░░░░░░░░]  50%  │ │ Fase:      2 · Interface observável             │
+│ Tasks  1/2      [███████████░░░░░░░░░░░░]  50%  │ │ Ciclo:     1/3    Gate: G2                      │
+└─────────────────────────────────────────────────┘ └─────────────────────────────────────────────────┘
+┌──────┬────────────────────────────────────────────┬────────────────┬───────────┬─────────────────────┐
+│ F2   │ Interface observável                       │ ▶ Em execução  │ 1         │ G0 ✓ G1 ✓ G2 ⋯ G3 · │
+│ T1   │   ↳ renderizar títulos longos              │ ✓ Concluída    │ –         │ –                   │
+│ T2   │   ↳ cobrir falhas de rede com retry        │ ▶ Em execução  │ –         │ –                   │
+└──────┴────────────────────────────────────────────┴────────────────┴───────────┴─────────────────────┘
+```
+
+### Where per-task progress comes from
+
+A phase is **one** agent session, so ralph could not know where the session is — unless the session says so. On the claude engine it does:
+
+The session runs with `--output-format stream-json`, which emits events line by line **while** it works. ralph reads that stream and rewrites progress into `.phases/state/live.tsv`, from four sources, in this order of precedence:
+
+1. **Text markers** (primary source). The prompt tells the agent to write, as a standalone line, `RALPH-TASK <n> START` before starting item *n* and `RALPH-TASK <n> DONE` once it is ready. It is plain text: it **depends on no tool at all** — which is what matters, because in a headless session (`claude -p`) task-list tools simply do not exist, even when the agent tries to load them via `ToolSearch`.
+2. **The agent's task list**, when the session has one (`TaskCreate`/`TaskUpdate` or `TodoWrite`): its `in_progress`/`completed` transitions become progress.
+3. **Observational fallback** — with no marker and no list, ralph infers from what the agent edits. A `/plan` plan declares `Arquivos:` on every item, and it is that match (edited path ↔ file declared by the task) that provides the granularity; without the declaration it falls back to the task's own text. On entering a task the earlier ones count as done — the agent works in order, and not every task has a file of its own.
+4. **Sign of life**: as soon as the session opens, task 1 shows as running — never a whole phase frozen at "Pendente".
+
+At the end of the phase, **gate 3 has the last word**: the verifier's `TASK <n>: DONE/INCOMPLETE` verdict overrides marker, list and inference alike. A task marked done but not in the code shows up as `! Incompleta`.
+
+So: during the phase the panel shows the agent's intent; at the end of the phase it shows the verified truth.
+
+On the **codex** engine there is no equivalent stream — granularity stays per phase, and tasks show as pending until gate 3's verdict.
+
+### Large plans: pinned top, scrolling table
+
+With dozens of tasks the table no longer fits on screen. The panel then keeps **the top pinned** (identification, bars, current work) and scrolls the phase/task table inside a window sized to the terminal — with a scrollbar on the right edge and a footer stating what fell outside:
+
+```
+  ▲ 23 above · ▼ 9 below · following the current phase · ↑↓ PgUp/PgDn scroll · f follows the phase
+```
+
+The running line — phase and task — is **highlighted end to end**, so it can be spotted at a glance in a full table.
+
+By default the window **follows the current phase**: it shows the whole phase block when it fits, and centers the running task when it doesn't. The keys below take over at any time and also work under `--dashboard`, with the panel embedded in ralph:
+
+| Key | Effect |
+|---|---|
+| `↑` `↓` or `k` `j` | Scrolls one line |
+| `PgUp` `PgDn`, `b` or space | Scrolls one page |
+| `Home`/`g` and `End`/`G` | First and last line |
+| `f` | Goes back to following the current phase |
+| `q` | Quits the panel (standalone mode only; does not stop ralph) |
+
+| Watch option | Effect |
+|---|---|
+| `--once` | Draws one frame and exits (useful in scripts/CI); full dump, no clipping |
+| `--interval N` | Seconds between frames (default: 1) |
+| `--no-color` | Disables ANSI |
+| `--color` | Forces ANSI even without a terminal (tests, files) |
+| `RALPH_WATCH_COLS` | Pins the width, for terminals that don't report it |
+| `RALPH_WATCH_LINES` | Pins the height; with `--once` it also enables the scrolling window |
+
+With `--dashboard`, ralph's log lines go to `.phases/logs/ralph.log` (the panel owns the screen) and the final report prints to the terminal on exit. Without `ralph-watch.sh` next to `ralph.sh`, `--dashboard` warns and falls back to log mode — `ralph.sh` stays copyable on its own into another repository.
+
 
 ### Input format contract
 
@@ -240,6 +311,7 @@ agents/                        specifier, clarifier, planner,
                                ai-context-{inspector,core,docs}
 scripts/
   ralph.sh                     phase-by-phase execution orchestrator
+  ralph-watch.sh               live run panel (reads .phases/state/)
   test-ralph.sh                red/green suite for ralph with a mock engine
   check-init-drift.sh          guards against textual drift of the rules
                                duplicated across the init commands
