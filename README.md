@@ -137,6 +137,7 @@ Core rules:
 ## `scripts/ralph.sh` — execution orchestrator
 
 Reads a phase document, splits it on the `## Phase N: <title>` heading, and feeds each phase to a **fresh** Codex CLI or Claude Code session, with no human interaction from start to finish.
+Run it using **Git Bash**!
 
 ```bash
 ./scripts/ralph.sh [options] [path-to-file]
