@@ -28,6 +28,10 @@
 #   --max-cycles N           fix cycles per phase (default: 3)
 #   --no-verify              turns off gate 3 (equivalent to RALPH_VERIFY=off)
 #   --test-cmd "<cmd>"       project test command (gate 2)
+#   --usage-guard [PCT]      claude engine only: before each session, ask the
+#                            account how much of the 5-hour window is spent, and
+#                            wait for the reset when it is at or above PCT
+#                            (default: 90). Off unless the flag is given.
 #   --dashboard              live panel in the terminal (requires ralph-watch.sh
 #                            next to this script); logs go to
 #                            .phases/logs/ralph.log
@@ -97,6 +101,20 @@
 #   RALPH_MAX_LIMIT_WAITS    consecutive limit waits, per phase (default: 20)
 #   RALPH_LIMIT_WAIT_DEFAULT wait fallback in seconds (default: 1800)
 #   RALPH_LIMIT_BUFFER       extra seconds after the reset (default: 60)
+#   RALPH_USAGE_THRESHOLD    usage guard threshold in % (default: 90)
+#   RALPH_USAGE_MIN_INTERVAL seconds between two usage requests (default: 60)
+#   RALPH_USAGE_ENDPOINT     usage endpoint; escape hatch if the URL moves
+#
+# Usage guard (--usage-guard), in detail:
+#   Item 4 above is REACTIVE: the session dies on a limit, ralph reads the reset
+#   off the log and re-runs the phase. The guard is the PROACTIVE half — it asks
+#   before starting, so a phase is not begun inside a window it cannot finish.
+#   It reads the OAuth token Claude Code already stores ($CLAUDE_CODE_OAUTH_TOKEN,
+#   the macOS Keychain, or $CLAUDE_CONFIG_DIR/.credentials.json) and GETs the
+#   account's usage endpoint. That endpoint is UNDOCUMENTED: any failure (no
+#   token, no curl, HTTP error, unreadable body) prints one warning, switches the
+#   guard off for the rest of the run, and leaves the reactive path in charge.
+#   A proactive wait never consumes a fix cycle.
 #
 # Exported for hooks (e.g. notify-n8n.sh) during each engine session:
 #   RALPH_ENGINE             codex | claude
@@ -124,6 +142,8 @@ MAX_CYCLES="${RALPH_MAX_CYCLES:-3}"
 VERIFY_MODE="${RALPH_VERIFY:-always}"
 VERIFY_MODEL=""
 DASHBOARD=false
+USAGE_GUARD=false
+USAGE_THRESHOLD="${RALPH_USAGE_THRESHOLD:-90}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -137,8 +157,15 @@ while [[ $# -gt 0 ]]; do
     --test-cmd=*)  TEST_CMD_FLAG="${1#*=}"; shift ;;
     --keep-going)  KEEP_GOING=true; shift ;;
     --no-verify)   VERIFY_MODE="off"; shift ;;
+    # The percentage is optional: --usage-guard alone keeps the default.
+    --usage-guard)
+      USAGE_GUARD=true; shift
+      if [[ "${1:-}" =~ ^[0-9]+$ ]]; then USAGE_THRESHOLD="$1"; shift; fi ;;
+    --usage-guard=*) USAGE_GUARD=true; USAGE_THRESHOLD="${1#*=}"; shift ;;
     --dashboard)   DASHBOARD=true; shift ;;
-    -h|--help)     sed -n '2,82p' "$0"; exit 0 ;;
+    # The whole header block, not a hardcoded line range that drifts every time
+    # an option is documented.
+    -h|--help)     awk 'NR>1 && /^#/ { print; next } NR>1 { exit }' "$0"; exit 0 ;;
     *)             INPUT_FILE="$1"; shift ;;
   esac
 done
@@ -156,10 +183,16 @@ RALPH_LOG="$LOG_DIR/ralph.log"
 MAX_LIMIT_WAITS="${RALPH_MAX_LIMIT_WAITS:-20}"
 LIMIT_WAIT_DEFAULT="${RALPH_LIMIT_WAIT_DEFAULT:-1800}"
 LIMIT_BUFFER="${RALPH_LIMIT_BUFFER:-60}"
+USAGE_ENDPOINT="${RALPH_USAGE_ENDPOINT:-https://api.anthropic.com/api/oauth/usage}"
+USAGE_MIN_INTERVAL="${RALPH_USAGE_MIN_INTERVAL:-60}"
+USAGE_LAST_CHECK=0
 
 TEST_CMD=""
 SAIL_BIN=""
 LIMIT_WAITS=0
+# Set while wait_for_reset is serving the usage guard instead of a dead session:
+# nothing failed, so the wait is not counted against the per-phase limit cap.
+PROACTIVE_WAIT=false
 # Current phase file: the stream watcher uses the task titles to match a
 # written file against the task that mentions it.
 CURRENT_PHASE_FILE=""
@@ -415,6 +448,16 @@ preflight_checks() {
   if ! [[ "$MAX_CYCLES" =~ ^[0-9]+$ ]] || [ "$MAX_CYCLES" -lt 1 ]; then
     fail "Invalid value for --max-cycles: '$MAX_CYCLES'. Use an integer >= 1."
     exit 1
+  fi
+
+  # A non-numeric threshold makes every comparison in the guard fall through to
+  # "wait" — it has to die here, not sleep through the run.
+  if $USAGE_GUARD; then
+    if ! [[ "$USAGE_THRESHOLD" =~ ^[0-9]+$ ]] || [ "$USAGE_THRESHOLD" -lt 1 ] \
+       || [ "$USAGE_THRESHOLD" -gt 100 ]; then
+      fail "Invalid value for --usage-guard: '$USAGE_THRESHOLD'. Use a percentage from 1 to 100."
+      exit 1
+    fi
   fi
 
   case "$VERIFY_MODE" in
@@ -1291,11 +1334,15 @@ wait_for_reset() {
   local now wait_secs
   now=$(date +%s)
 
-  LIMIT_WAITS=$((LIMIT_WAITS + 1))
-  if [ "$LIMIT_WAITS" -gt "$MAX_LIMIT_WAITS" ]; then
-    fail "Usage limit hit $LIMIT_WAITS times in a row on this phase (cap: $MAX_LIMIT_WAITS)."
-    fail "Aborting instead of sleeping indefinitely."
-    exit 1
+  # A proactive wait is not a failure: it must not count against the cap, and it
+  # must not eat a fix cycle (the caller has not launched a session yet).
+  if ! $PROACTIVE_WAIT; then
+    LIMIT_WAITS=$((LIMIT_WAITS + 1))
+    if [ "$LIMIT_WAITS" -gt "$MAX_LIMIT_WAITS" ]; then
+      fail "Usage limit hit $LIMIT_WAITS times in a row on this phase (cap: $MAX_LIMIT_WAITS)."
+      fail "Aborting instead of sleeping indefinitely."
+      exit 1
+    fi
   fi
 
   if [[ "$epoch" =~ ^[0-9]+$ ]] && [ "$epoch" -gt 0 ]; then
@@ -1306,20 +1353,26 @@ wait_for_reset() {
     if [ "$wait_secs" -lt "$LIMIT_BUFFER" ]; then
       wait_secs=$LIMIT_BUFFER
     fi
-    warn "Usage limit reached. Reset expected at $(date -d "@$epoch" '+%d/%m %H:%M:%S')."
+    $PROACTIVE_WAIT || warn "Usage limit reached. Reset expected at $(date -d "@$epoch" '+%d/%m %H:%M:%S')."
   else
     wait_secs=$LIMIT_WAIT_DEFAULT
     warn "Usage limit reached. No reset time in the output; waiting on the fallback."
   fi
 
-  warn "Wait $LIMIT_WAITS/$MAX_LIMIT_WAITS — waiting $(format_duration "$wait_secs") before resuming the SAME phase..."
+  if $PROACTIVE_WAIT; then
+    warn "Waiting $(format_duration "$wait_secs") before starting the session..."
+  else
+    warn "Wait $LIMIT_WAITS/$MAX_LIMIT_WAITS — waiting $(format_duration "$wait_secs") before resuming the SAME phase..."
+  fi
 
   META[status]="waiting"
+  local label="usage limit"
+  $PROACTIVE_WAIT && label="usage guard"
   local remaining=$wait_secs chunk
   while [ "$remaining" -gt 0 ]; do
     chunk=60
     [ "$remaining" -lt 60 ] && chunk=$remaining
-    state_meta activity "usage limit — resuming in $(format_duration "$remaining")"
+    state_meta activity "$label — resuming in $(format_duration "$remaining")"
     sleep "$chunk"
     remaining=$((remaining - chunk))
     [ "$remaining" -gt 0 ] && log "Resuming in $(format_duration "$remaining")..."
@@ -1328,6 +1381,136 @@ wait_for_reset() {
   state_meta activity "resuming the phase"
 
   success "Reset likely complete. Resuming execution."
+}
+
+# ---------------------------------------------------------------------------
+# Usage guard — the PROACTIVE half of item 4: ask before starting a phase,
+# instead of finding out when the session dies halfway through it.
+# ---------------------------------------------------------------------------
+
+# usage_guard_off <reason> — one warning, then never again for this run.
+usage_guard_off() {
+  USAGE_GUARD=false
+  warn "Usage guard disabled: $1"
+  warn "Falling back to detecting the limit from the session output."
+}
+
+# usage_token — echoes the OAuth token Claude Code already holds, in the same
+# order of precedence the CLI itself uses. Returns 1 when there is none (an
+# ANTHROPIC_API_KEY user, for instance, has no subscription window to read).
+usage_token() {
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    echo "$CLAUDE_CODE_OAUTH_TOKEN"
+    return 0
+  fi
+
+  local tok=""
+  # macOS keeps the credentials in the Keychain, not on disk.
+  if command -v security >/dev/null 2>&1; then
+    tok=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+          | grep -oE '"accessToken":"[^"]+"' | head -1 | cut -d'"' -f4) || true
+    if [ -n "$tok" ]; then echo "$tok"; return 0; fi
+  fi
+
+  local creds="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+  if [ -r "$creds" ]; then
+    tok=$(grep -oE '"accessToken":"[^"]+"' "$creds" | head -1 | cut -d'"' -f4) || true
+    if [ -n "$tok" ]; then echo "$tok"; return 0; fi
+  fi
+
+  return 1
+}
+
+# usage_snapshot <token> — echoes "<percent><TAB><reset_epoch>" for the 5-hour
+# window. Returns 1 when the request or the parse fails.
+#
+# No jq anywhere in this script, and the fields we need are flat, so grep does
+# it. Two shapes are accepted because the payload carries both: the named
+# five_hour object and the limits[] entry with kind "session".
+usage_snapshot() {
+  local token="$1" body="" obj="" pct="" iso="" epoch=""
+
+  body=$(curl -sf --max-time 15 \
+           -H "Authorization: Bearer $token" \
+           -H "anthropic-beta: oauth-2025-04-20" \
+           "$USAGE_ENDPOINT" 2>/dev/null) || return 1
+  [ -n "$body" ] || return 1
+
+  # Neither object nests, so [^}]* cannot run past its own closing brace.
+  obj=$(grep -oE '"five_hour":\{[^}]*\}' <<< "$body" | head -1) || true
+  if [ -n "$obj" ]; then
+    # utilization is a float (99.0); the threshold compare is integer.
+    pct=$(grep -oE '"utilization":[0-9]+' <<< "$obj" | head -1 | cut -d: -f2) || true
+  fi
+  if [ -z "$pct" ]; then
+    obj=$(grep -oE '\{"kind":"session"[^}]*\}' <<< "$body" | head -1) || true
+    pct=$(grep -oE '"percent":[0-9]+' <<< "$obj" | head -1 | cut -d: -f2) || true
+  fi
+  [[ "$pct" =~ ^[0-9]+$ ]] || return 1
+
+  iso=$(grep -oE '"resets_at":"[^"]+"' <<< "$obj" | head -1 | cut -d'"' -f4) || true
+  if [ -n "$iso" ]; then
+    epoch=$(date -d "$iso" +%s 2>/dev/null) || epoch=""
+  fi
+  [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+
+  printf '%s\t%s\n' "$pct" "$epoch"
+}
+
+# guard_usage_headroom — called before every engine launch. Waits for the reset
+# when the 5-hour window is at or above the threshold. Never fails the run: a
+# guard that cannot answer turns itself off and lets the reactive path work.
+guard_usage_headroom() {
+  $USAGE_GUARD || return 0
+  [[ "$ENGINE" == "claude" ]] || return 0
+
+  # Each phase launches an implementation and a verifier session; asking on
+  # every one of them adds nothing and the endpoint rate-limits.
+  local now
+  now=$(date +%s)
+  if [ "$USAGE_LAST_CHECK" -gt 0 ] \
+     && [ $((now - USAGE_LAST_CHECK)) -lt "$USAGE_MIN_INTERVAL" ]; then
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    usage_guard_off "curl not found."
+    return 0
+  fi
+
+  local token
+  if ! token=$(usage_token); then
+    usage_guard_off "no OAuth token (\$CLAUDE_CODE_OAUTH_TOKEN, Keychain or .credentials.json)."
+    return 0
+  fi
+
+  local snap
+  if ! snap=$(usage_snapshot "$token"); then
+    usage_guard_off "could not read $USAGE_ENDPOINT."
+    return 0
+  fi
+  USAGE_LAST_CHECK=$(date +%s)
+
+  local pct epoch
+  pct=${snap%%$'\t'*}
+  epoch=${snap##*$'\t'}
+
+  if [ "$pct" -lt "$USAGE_THRESHOLD" ]; then
+    log "Session usage ${pct}% (threshold ${USAGE_THRESHOLD}%) — going ahead."
+    return 0
+  fi
+
+  if [ "$epoch" -gt 0 ]; then
+    warn "Session usage ${pct}% >= ${USAGE_THRESHOLD}% — reset at $(date -d "@$epoch" '+%d/%m %H:%M:%S')."
+  else
+    warn "Session usage ${pct}% >= ${USAGE_THRESHOLD}% — no reset time in the response."
+  fi
+
+  PROACTIVE_WAIT=true
+  wait_for_reset "$epoch"
+  PROACTIVE_WAIT=false
+  # The window has rolled over: the cached reading is stale.
+  USAGE_LAST_CHECK=0
 }
 
 # ---------------------------------------------------------------------------
@@ -1346,6 +1529,10 @@ run_engine() {
   if [[ "$mode" == "verify" ]] && [ -n "$VERIFY_MODEL" ]; then
     model_args=(--model "$VERIFY_MODEL")
   fi
+
+  # Outside the loop on purpose: the loop below is the reactive retry, which
+  # already waited for a reset. Re-asking there could sleep on a stale reading.
+  guard_usage_headroom
 
   while true; do
     local rc=0

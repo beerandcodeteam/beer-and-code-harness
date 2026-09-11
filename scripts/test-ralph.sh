@@ -220,6 +220,28 @@ MOCK
   chmod +x "$bin/mock-engine"
   cp "$bin/mock-engine" "$bin/claude"
   cp "$bin/mock-engine" "$bin/codex"
+
+  # curl mock — the usage guard is the only thing in ralph that calls curl.
+  # Counts calls (usage_calls) and fakes the endpoint via MOCK_USAGE_*.
+  cat > "$bin/curl" <<'CURLMOCK'
+#!/usr/bin/env bash
+set -uo pipefail
+state="${MOCK_STATE:?}"
+f="$state/usage_calls"; n=0
+[ -f "$f" ] && n=$(cat "$f")
+n=$((n + 1)); echo "$n" > "$f"
+
+case "${MOCK_USAGE_HTTP:-ok}" in
+  fail)    exit 22 ;;   # what curl -f returns on an HTTP error
+  garbage) echo "<html>upstream error</html>"; exit 0 ;;
+esac
+
+pct="${MOCK_USAGE_PCT:-5}"
+reset_at=$(date -u -d "+${MOCK_USAGE_RESET_IN:-1} seconds" '+%Y-%m-%dT%H:%M:%S.000000+00:00')
+printf '%s' "{\"five_hour\":{\"utilization\":${pct}.0,\"resets_at\":\"${reset_at}\",\"limit_dollars\":null},\"seven_day\":{\"utilization\":41.0,\"resets_at\":\"${reset_at}\"},\"limits\":[{\"kind\":\"session\",\"group\":\"session\",\"percent\":${pct},\"severity\":\"normal\",\"resets_at\":\"${reset_at}\",\"scope\":null,\"is_active\":true}]}"
+exit 0
+CURLMOCK
+  chmod +x "$bin/curl"
 }
 
 make_testcmd() {
@@ -346,9 +368,28 @@ run_ralph() {
     RALPH_LIMIT_BUFFER=1 \
     RALPH_VERIFY="${CASE_VERIFY:-}" \
     RALPH_VERIFY_MODEL="${CASE_VERIFY_MODEL:-}" \
+    RALPH_USAGE_ENDPOINT="${CASE_USAGE_ENDPOINT:-https://usage.invalid/usage}" \
+    RALPH_USAGE_MIN_INTERVAL="${CASE_USAGE_MIN_INTERVAL:-60}" \
+    CLAUDE_CODE_OAUTH_TOKEN="${CASE_OAUTH_TOKEN-sk-ant-oat01-fake}" \
+    CLAUDE_CONFIG_DIR="${CASE_CONFIG_DIR:-$dir/claude-home}" \
+    MOCK_USAGE_PCT="${CASE_USAGE_PCT:-5}" \
+    MOCK_USAGE_RESET_IN="${CASE_USAGE_RESET_IN:-1}" \
+    MOCK_USAGE_HTTP="${CASE_USAGE_HTTP:-ok}" \
       bash "$RALPH" "$@" > "$dir/out.log" 2>&1
   ) || rc=$?
   echo "$rc"
+}
+
+# usage_calls <dir> -> how many times the guard hit the endpoint (0 when never)
+usage_calls() { cat "$1/state/usage_calls" 2>/dev/null || echo 0; }
+
+# CASE_* are plain shell variables: without this they leak into the next case.
+reset_usage_case() {
+  CASE_USAGE_PCT=5
+  CASE_USAGE_RESET_IN=1
+  CASE_USAGE_HTTP=ok
+  CASE_USAGE_MIN_INTERVAL=60
+  CASE_OAUTH_TOKEN="sk-ant-oat01-fake"
 }
 
 # Same as run_ralph, but PRESERVES the caller's RALPH_TEST_CMD — to deliberately
@@ -1400,6 +1441,156 @@ if case_enabled watch-frame; then
   else
     ok "tmux absent — frame integration skipped"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Usage guard (--usage-guard): PROACTIVE wait, before burning a phase.
+# Distinct from cases 5-7, which are REACTIVE (limit read off the session log).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 38. Session at/over the threshold -> waits BEFORE launching, no cycle consumed
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-waits; then
+  header "38. usage guard: session over the threshold -> waits before the phase"
+  reset_usage_case
+  d=$(new_case usage-guard-waits)
+  # --max-cycles 1: a proactive wait must not consume a fix cycle either.
+  CASE_USAGE_PCT=97 \
+    rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --max-cycles 1 --usage-guard)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 3 "$(commits "$d")" "phases committed after the wait"
+  assert_contains "$d/out.log" "Session usage 97%" "reported the measured usage"
+  assert_contains "$d/out.log" "before starting" "waited BEFORE the session (not after a failure)"
+  assert_not_contains "$d/out.log" "Usage limit reached" "did not go through the reactive path"
+fi
+
+# ---------------------------------------------------------------------------
+# 39. Session below the threshold -> no wait
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-below; then
+  header "39. usage guard: session below the threshold -> runs straight through"
+  reset_usage_case
+  d=$(new_case usage-guard-below)
+  CASE_USAGE_PCT=40 \
+    rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --usage-guard)
+  assert_eq 0 "$rc" "exit 0"
+  assert_not_contains "$d/out.log" "before starting" "no wait below the threshold"
+  [ "$(usage_calls "$d")" -ge 1 ] && ok "endpoint was consulted" || bad "endpoint was consulted"
+fi
+
+# ---------------------------------------------------------------------------
+# 40. --usage-guard N overrides the default threshold
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-threshold; then
+  header "40. usage guard: --usage-guard N sets the threshold"
+  reset_usage_case
+  d=$(new_case usage-guard-threshold)
+  CASE_USAGE_PCT=40 \
+    rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --max-cycles 1 --usage-guard 30)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "Session usage 40%" "40% tripped the 30% threshold"
+  assert_contains "$d/out.log" "before starting" "waited on the custom threshold"
+fi
+
+# ---------------------------------------------------------------------------
+# 41. Guard is opt-in: without the flag nothing is read and nothing is called
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-off; then
+  header "41. usage guard: off by default"
+  reset_usage_case
+  d=$(new_case usage-guard-off)
+  CASE_USAGE_PCT=99 \
+    rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 0 "$(usage_calls "$d")" "endpoint never consulted without --usage-guard"
+  assert_not_contains "$d/out.log" "Session usage" "silent when the guard is off"
+fi
+
+# ---------------------------------------------------------------------------
+# 42. Endpoint down -> warns ONCE, disables the guard, run still completes
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-endpoint-down; then
+  header "42. usage guard: endpoint down -> degrades, never aborts"
+  reset_usage_case
+  d=$(new_case usage-guard-endpoint-down)
+  CASE_USAGE_HTTP=fail \
+    rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --usage-guard)
+  assert_eq 0 "$rc" "exit 0 (a broken guard must not fail the run)"
+  assert_eq 3 "$(commits "$d")" "phases still committed"
+  assert_contains "$d/out.log" "Usage guard disabled" "warned that the guard went down"
+  assert_eq 1 "$(grep -c "Usage guard disabled" "$d/out.log")" "warned exactly once, not per phase"
+  assert_eq 1 "$(usage_calls "$d")" "stopped calling the endpoint after the failure"
+fi
+
+# ---------------------------------------------------------------------------
+# 43. Unparsable body -> same degradation as a dead endpoint
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-garbage; then
+  header "43. usage guard: unparsable body -> degrades"
+  reset_usage_case
+  d=$(new_case usage-guard-garbage)
+  CASE_USAGE_HTTP=garbage \
+    rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --usage-guard)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "Usage guard disabled" "warned on the unreadable response"
+fi
+
+# ---------------------------------------------------------------------------
+# 44. No OAuth token -> guard disables itself without calling anything
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-no-token; then
+  header "44. usage guard: no token -> disables itself"
+  reset_usage_case
+  d=$(new_case usage-guard-no-token)
+  CASE_OAUTH_TOKEN="" \
+    rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --usage-guard)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 0 "$(usage_calls "$d")" "no token -> no request"
+  assert_contains "$d/out.log" "Usage guard disabled" "explained why the guard is off"
+fi
+
+# ---------------------------------------------------------------------------
+# 45. codex engine -> guard does not apply (the endpoint is Claude's)
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-codex; then
+  header "45. usage guard: ignored on the codex engine"
+  reset_usage_case
+  d=$(new_case usage-guard-codex)
+  CASE_USAGE_PCT=99 \
+    rc=$(run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh" --usage-guard)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 0 "$(usage_calls "$d")" "codex never hits the Claude usage endpoint"
+fi
+
+# ---------------------------------------------------------------------------
+# 46. Throttle: several launches inside the window -> one request
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-throttle; then
+  header "46. usage guard: throttled to one request per window"
+  reset_usage_case
+  d=$(new_case usage-guard-throttle)
+  # 2 phases x (impl + verify) = 4 engine launches, all inside a 600s window.
+  CASE_USAGE_PCT=40 CASE_USAGE_MIN_INTERVAL=600 \
+    rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --usage-guard)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 2 "$(cat "$d/state/impl_calls")" "2 implementation launches"
+  assert_eq 2 "$(cat "$d/state/verify_calls")" "2 verifier launches"
+  assert_eq 1 "$(usage_calls "$d")" "one request for all of them"
+fi
+
+# ---------------------------------------------------------------------------
+# 47. Non-numeric threshold -> refused at preflight, before any token is spent
+# ---------------------------------------------------------------------------
+if case_enabled usage-guard-bad-threshold; then
+  header "47. usage guard: non-numeric threshold -> abort at preflight"
+  reset_usage_case
+  d=$(new_case usage-guard-bad-threshold)
+  rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --usage-guard=abc)
+  assert_eq 1 "$rc" "exit 1"
+  assert_contains "$d/out.log" "Invalid value for --usage-guard" "said which value was wrong"
+  assert_eq 0 "$(usage_calls "$d")" "aborted before touching the endpoint"
+  assert_eq 1 "$(commits "$d")" "no phase ran"
 fi
 
 # ---------------------------------------------------------------------------

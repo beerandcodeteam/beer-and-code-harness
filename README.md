@@ -184,6 +184,7 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 | `--max-cycles N` | Fix cycles per phase (default: 3) |
 | `--test-cmd "<cmd>"` | Project test command (gate 2) |
 | `--no-verify` | Disables gate 3 |
+| `--usage-guard [PCT]` | `claude` engine only: waits for the reset when the 5-hour window is at or above PCT before starting a session (default: 90). Off unless given — see below |
 | `--dashboard` | Live panel in the terminal (see below) |
 
 | Variable | Effect |
@@ -195,8 +196,26 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 | `RALPH_MAX_LIMIT_WAITS` | Consecutive usage-limit waits, per phase (default: 20) |
 | `RALPH_LIMIT_WAIT_DEFAULT` | Fallback wait in seconds (default: 1800) |
 | `RALPH_LIMIT_BUFFER` | Extra seconds after the reset (default: 60) |
+| `RALPH_USAGE_THRESHOLD` | Usage-guard threshold in % (default: 90) |
+| `RALPH_USAGE_MIN_INTERVAL` | Seconds between two usage requests (default: 60) |
+| `RALPH_USAGE_ENDPOINT` | Usage endpoint — escape hatch if the URL moves |
 
 During each session, ralph exports `RALPH_ENGINE`, `RALPH_PHASE_TITLE`, `RALPH_PHASE_NUM`, `RALPH_PHASE_TOTAL`, `RALPH_PHASE_ATTEMPT`, and `RALPH_PHASE_MAX_ATTEMPTS` — useful for notification hooks (e.g. n8n).
+
+### Usage guard (`--usage-guard`)
+
+ralph has always handled usage limits **reactively**: the session dies, ralph reads the reset time off the log, waits, and re-runs the same phase without consuming a fix cycle. `--usage-guard` adds the **proactive** half — it asks before starting, so a phase is not begun inside a window that cannot finish it.
+
+```bash
+./scripts/ralph.sh --engine claude --usage-guard        # waits at >= 90%
+./scripts/ralph.sh --engine claude --usage-guard 80     # waits at >= 80%
+```
+
+Before each session ralph reads the OAuth token Claude Code already stores (`$CLAUDE_CODE_OAUTH_TOKEN`, the macOS Keychain, or `$CLAUDE_CONFIG_DIR/.credentials.json`) and queries the account's usage endpoint for the 5-hour window. At or above the threshold it waits until the reset (plus `RALPH_LIMIT_BUFFER`) and then starts the phase. A proactive wait never consumes a fix cycle.
+
+The reading is cached for `RALPH_USAGE_MIN_INTERVAL` seconds so that the implementation and verifier sessions of a phase do not each issue a request.
+
+> The endpoint is **undocumented** and can change without notice. Every failure path — no token, no `curl`, HTTP error, unreadable body — prints one warning, switches the guard off for the rest of the run, and leaves the reactive detection in charge. The guard is a convenience; it is never what keeps a run alive. It is ignored on `--engine codex`, whose quota lives elsewhere.
 
 ### State and progress
 

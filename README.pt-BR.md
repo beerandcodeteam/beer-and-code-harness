@@ -179,6 +179,7 @@ Projeto Laravel Sail: a suite roda **dentro do container** (`vendor/bin/sail tes
 | `--max-cycles N` | Ciclos de correção por fase (default: 3) |
 | `--test-cmd "<cmd>"` | Comando de teste do projeto (gate 2) |
 | `--no-verify` | Desliga o gate 3 |
+| `--usage-guard [PCT]` | Só no engine `claude`: espera o reset quando a janela de 5 horas está em PCT ou mais antes de iniciar uma sessão (default: 90). Desligado se não for passado — ver abaixo |
 | `--dashboard` | Painel ao vivo no terminal (ver abaixo) |
 
 | Variável | Efeito |
@@ -190,8 +191,26 @@ Projeto Laravel Sail: a suite roda **dentro do container** (`vendor/bin/sail tes
 | `RALPH_MAX_LIMIT_WAITS` | Esperas consecutivas por limite de uso, por fase (default: 20) |
 | `RALPH_LIMIT_WAIT_DEFAULT` | Fallback de espera em segundos (default: 1800) |
 | `RALPH_LIMIT_BUFFER` | Segundos extras após o reset (default: 60) |
+| `RALPH_USAGE_THRESHOLD` | Limiar do usage guard em % (default: 90) |
+| `RALPH_USAGE_MIN_INTERVAL` | Segundos entre duas consultas de uso (default: 60) |
+| `RALPH_USAGE_ENDPOINT` | Endpoint de uso — saída de emergência se a URL mudar |
 
 Durante cada sessão, o ralph exporta `RALPH_ENGINE`, `RALPH_PHASE_TITLE`, `RALPH_PHASE_NUM`, `RALPH_PHASE_TOTAL`, `RALPH_PHASE_ATTEMPT` e `RALPH_PHASE_MAX_ATTEMPTS` — úteis para hooks de notificação (ex.: n8n).
+
+### Usage guard (`--usage-guard`)
+
+O ralph sempre tratou limite de uso de forma **reativa**: a sessão morre, o ralph lê o horário do reset no log, espera e reexecuta a MESMA fase sem consumir ciclo de correção. O `--usage-guard` acrescenta a metade **proativa** — ele pergunta antes de começar, para não iniciar uma fase dentro de uma janela que não vai dar conta de terminá-la.
+
+```bash
+./scripts/ralph.sh --engine claude --usage-guard        # espera a partir de 90%
+./scripts/ralph.sh --engine claude --usage-guard 80     # espera a partir de 80%
+```
+
+Antes de cada sessão o ralph lê o token OAuth que o próprio Claude Code já guarda (`$CLAUDE_CODE_OAUTH_TOKEN`, o Keychain do macOS ou `$CLAUDE_CONFIG_DIR/.credentials.json`) e consulta o endpoint de uso da conta para a janela de 5 horas. No limiar ou acima dele, espera até o reset (mais `RALPH_LIMIT_BUFFER`) e só então inicia a fase. Uma espera proativa nunca consome ciclo de correção.
+
+A leitura fica em cache por `RALPH_USAGE_MIN_INTERVAL` segundos, para que as sessões de implementação e de verificação de uma fase não façam uma consulta cada.
+
+> O endpoint é **não documentado** e pode mudar sem aviso. Todo caminho de falha — sem token, sem `curl`, erro HTTP, resposta ilegível — emite um aviso, desliga o guard pelo resto da execução e deixa a detecção reativa no comando. O guard é conveniência; nunca é o que mantém a execução viva. É ignorado no `--engine codex`, cuja cota vive em outro lugar.
 
 ### Estado e progresso
 
