@@ -28,6 +28,19 @@
 #   --max-cycles N           fix cycles per phase (default: 3)
 #   --no-verify              turns off gate 3 (equivalent to RALPH_VERIFY=off)
 #   --test-cmd "<cmd>"       project test command (gate 2)
+#   --dashboard              live panel in the terminal (requires ralph-watch.sh
+#                            next to this script); logs go to
+#                            .phases/logs/ralph.log
+#
+# Observability:
+#   Run state is ALWAYS published to .phases/state/ (run.tsv + live.tsv), with
+#   or without --dashboard. To follow along from another terminal:
+#       ./ralph-watch.sh /path/to/repo
+#   On the claude engine the session runs with --output-format stream-json,
+#   which gives PER-TASK progress in real time: the prompt tells the agent to
+#   register one task per `- [ ]` item of the phase, and ralph reads those
+#   transitions off the stream.
+#   On the codex engine there is no equivalent stream: granularity is per phase.
 #
 # Input (first positional argument). With no argument, resolves in this order:
 #   1. .spec/init/project-phases.md      (init chain)
@@ -54,7 +67,7 @@
 #      that wrote nothing (claims "already implemented"), a fix cycle, or
 #      gate 2 disabled. --no-verify / RALPH_VERIFY=off turns it off. On the
 #      claude engine the verifier uses a cheap model (RALPH_VERIFY_MODEL,
-#      default: haiku) — it's read + checklist.
+#      default: sonnet) — it's read + checklist.
 #
 # Green gates with a clean tree => the phase was already implemented on HEAD:
 # marked as done, no commit (nothing to commit).
@@ -79,7 +92,7 @@
 # Environment variables:
 #   RALPH_TEST_CMD           test command (gate 2); --test-cmd takes priority
 #   RALPH_VERIFY             gate 3: always (default) | auto | off
-#   RALPH_VERIFY_MODEL       verifier model (default: haiku on claude)
+#   RALPH_VERIFY_MODEL       verifier model (default: sonnet on claude)
 #   RALPH_MAX_CYCLES         fix cycles per phase (default: 3)
 #   RALPH_MAX_LIMIT_WAITS    consecutive limit waits, per phase (default: 20)
 #   RALPH_LIMIT_WAIT_DEFAULT wait fallback in seconds (default: 1800)
@@ -110,6 +123,7 @@ TEST_CMD_FLAG=""
 MAX_CYCLES="${RALPH_MAX_CYCLES:-3}"
 VERIFY_MODE="${RALPH_VERIFY:-always}"
 VERIFY_MODEL=""
+DASHBOARD=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -123,7 +137,8 @@ while [[ $# -gt 0 ]]; do
     --test-cmd=*)  TEST_CMD_FLAG="${1#*=}"; shift ;;
     --keep-going)  KEEP_GOING=true; shift ;;
     --no-verify)   VERIFY_MODE="off"; shift ;;
-    -h|--help)     sed -n '2,70p' "$0"; exit 0 ;;
+    --dashboard)   DASHBOARD=true; shift ;;
+    -h|--help)     sed -n '2,82p' "$0"; exit 0 ;;
     *)             INPUT_FILE="$1"; shift ;;
   esac
 done
@@ -131,8 +146,12 @@ done
 PHASES_DIR=".phases"
 LOG_DIR=".phases/logs"
 PROMPT_DIR=".phases/prompts"
+STATE_DIR=".phases/state"
 MANIFEST="$PHASES_DIR/manifest.txt"
 PROGRESS_FILE="$PHASES_DIR/.progress"
+RUN_STATE="$STATE_DIR/run.tsv"
+LIVE_STATE="$STATE_DIR/live.tsv"
+RALPH_LOG="$LOG_DIR/ralph.log"
 
 MAX_LIMIT_WAITS="${RALPH_MAX_LIMIT_WAITS:-20}"
 LIMIT_WAIT_DEFAULT="${RALPH_LIMIT_WAIT_DEFAULT:-1800}"
@@ -141,6 +160,9 @@ LIMIT_BUFFER="${RALPH_LIMIT_BUFFER:-60}"
 TEST_CMD=""
 SAIL_BIN=""
 LIMIT_WAITS=0
+# Current phase file: the stream watcher uses the task titles to match a
+# written file against the task that mentions it.
+CURRENT_PHASE_FILE=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -148,10 +170,16 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log()     { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"; }
-success() { echo -e "${GREEN}[$(date '+%H:%M:%S')] $1${NC}"; }
-warn()    { echo -e "${YELLOW}[$(date '+%H:%M:%S')] $1${NC}"; }
-fail()    { echo -e "${RED}[$(date '+%H:%M:%S')] $1${NC}"; }
+# With --dashboard the panel owns the screen: log lines go to LOG_SINK
+# (.phases/logs/ralph.log) instead of fighting over the terminal.
+LOG_SINK=""
+
+emit() { if [ -n "$LOG_SINK" ]; then echo -e "$1" >> "$LOG_SINK"; else echo -e "$1"; fi; }
+
+log()     { emit "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"; }
+success() { emit "${GREEN}[$(date '+%H:%M:%S')] $1${NC}"; }
+warn()    { emit "${YELLOW}[$(date '+%H:%M:%S')] $1${NC}"; }
+fail()    { emit "${RED}[$(date '+%H:%M:%S')] $1${NC}"; }
 
 format_duration() {
   local total_seconds=$1
@@ -277,6 +305,41 @@ check_sail_running() {
   log "Sail: containers up"
 }
 
+# Gate 2 runs this command once per cycle, on every phase. If the executable
+# does not exist, EVERY phase fails for a reason that has nothing to do with
+# the code, burning all 3 fix cycles of each one — the same damage the Sail
+# container check prevents. Better to abort before the first session.
+#
+# The real case: RALPH_TEST_CMD="vendor/bin/sail ..." exported in the dev's
+# shell beats manifest detection in ANY project they run it in, including one
+# with no Sail at all. The message has to say where the command came from.
+check_test_cmd_runnable() {
+  local origin="$1"
+  local first="${TEST_CMD%% *}"
+
+  if [[ "$first" == */* ]]; then
+    [ -x "$first" ] && return 0
+  else
+    command -v "$first" > /dev/null 2>&1 && return 0
+  fi
+
+  fail "Gate 2 test command not executable: '$first'"
+  fail "Full command ($origin): $TEST_CMD"
+  case "$origin" in
+    RALPH_TEST_CMD)
+      fail "That variable is exported in your environment and beats manifest"
+      fail "detection in any project. For this run, override it with:"
+      fail "    --test-cmd '<this project's command>'"
+      fail "or clear the variable:  env -u RALPH_TEST_CMD $0 ..."
+      ;;
+    *)
+      fail "Pass --test-cmd '<command>' with this project's correct runner."
+      ;;
+  esac
+  fail "Aborting before the first session: every gate 2 would fail and burn the fix cycles."
+  exit 1
+}
+
 resolve_test_cmd() {
   SAIL_BIN="$(detect_sail || true)"
 
@@ -284,6 +347,7 @@ resolve_test_cmd() {
     TEST_CMD="$TEST_CMD_FLAG"
     log "Gate 2 — test command (--test-cmd): $TEST_CMD"
     check_sail_running
+    check_test_cmd_runnable "--test-cmd"
     return 0
   fi
 
@@ -291,6 +355,7 @@ resolve_test_cmd() {
     TEST_CMD="$RALPH_TEST_CMD"
     log "Gate 2 — test command (RALPH_TEST_CMD): $TEST_CMD"
     check_sail_running
+    check_test_cmd_runnable "RALPH_TEST_CMD"
     return 0
   fi
 
@@ -325,6 +390,7 @@ resolve_test_cmd() {
   if [ -n "$TEST_CMD" ]; then
     log "Gate 2 — test command (detected): $TEST_CMD"
     check_sail_running
+    check_test_cmd_runnable "detectado"
   else
     warn "Gate 2 DISABLED: no test command resolved."
     if [ "$VERIFY_MODE" = "off" ]; then
@@ -364,7 +430,7 @@ preflight_checks() {
   if [ -n "${RALPH_VERIFY_MODEL:-}" ]; then
     VERIFY_MODEL="$RALPH_VERIFY_MODEL"
   elif [[ "$ENGINE" == "claude" ]]; then
-    VERIFY_MODEL="haiku"
+    VERIFY_MODEL="sonnet"
   fi
 
   if ! command -v "$ENGINE" &> /dev/null; then
@@ -500,6 +566,480 @@ apply_from_override() {
 }
 
 # ---------------------------------------------------------------------------
+# Observable state (.phases/state/) — consumed by ralph-watch.sh
+# ---------------------------------------------------------------------------
+#
+# Two files, ONE WRITER EACH. The stream watcher runs in a subprocess (end of a
+# pipe) and shares no memory with the main loop; if both wrote the same file,
+# one would overwrite the other on every flush.
+#   run.tsv   main loop: phases, gates, attempts, run metadata
+#   live.tsv  stream watcher: current task and session activity
+# The renderer merges them on read.
+#
+# State is published always, with or without --dashboard: that is what lets you
+# open ralph-watch.sh in another terminal in the middle of a run already going.
+
+declare -A META PH_FILE PH_TITLE PH_STATUS PH_ATTEMPT PH_GATES
+declare -A TK_TITLE TK_STATUS TK_COUNT
+PHASE_NUMS=()
+
+# Task titles of a phase, one per line, without the markdown noise.
+phase_task_titles() {
+  local phase_file="$1"
+  [ -f "$PHASES_DIR/$phase_file" ] || return 0
+  grep -E '^[[:space:]]*- \[[ x]\]' "$PHASES_DIR/$phase_file" 2>/dev/null \
+    | sed -E 's/^[[:space:]]*- \[[ x]\][[:space:]]*//
+              s/\*\*Task:\*\*[[:space:]]*//
+              s/\*\*//g
+              s/`//g
+              s/[[:space:]]+$//' \
+    || true
+}
+
+# Files each task declares, so the panel can tell which task the agent is on
+# just by what it edits. A /plan plan carries "Files: `path`" in the item body;
+# it is the most reliable signal available without depending on the model
+# cooperating with any protocol.
+#
+# Emits: <task-index><TAB><weight><TAB><path>
+#   weight 1 = declared on the "Files:" line (the task's target)
+#   weight 2 = mentioned elsewhere in the body (reference, mirror, example)
+#
+# Both the English "Files:" (this fork's planner templates) and the upstream
+# Portuguese "Arquivos:" are accepted, so plans of either vintage work.
+phase_task_files() {
+  local phase_file="$1"
+  [ -f "$PHASES_DIR/$phase_file" ] || return 0
+  awk '
+    # extensions that mark a code/config file; without this, tokens like
+    # "services.iss_rate" (a column) would come through as if they were paths
+    BEGIN {
+      split("php js jsx ts tsx vue py rb go rs java kt swift cs sql md yml yaml json xml css scss sass html blade twig sh bash env lock toml ini cfg conf tf gradle", e, " ")
+      for (i in e) ext[e[i]] = 1
+    }
+    /^[[:space:]]*- \[[ xX]\]/ { idx++ }
+    idx == 0 { next }
+    {
+      line = $0
+      lvl = (line ~ /(Arquivos?|Files?):/) ? 1 : 2
+      while (match(line, /[A-Za-z0-9_][A-Za-z0-9_.\/-]*\.[A-Za-z0-9]+/)) {
+        p = substr(line, RSTART, RLENGTH)
+        line = substr(line, RSTART + RLENGTH)
+        n = split(p, parts, ".")
+        if (!(parts[n] in ext)) continue
+        print idx "\t" lvl "\t" p
+      }
+    }
+  ' "$PHASES_DIR/$phase_file" 2>/dev/null || true
+}
+
+state_flush() {
+  local tmp="$RUN_STATE.$$"
+  {
+    local k num i
+    for k in "${!META[@]}"; do printf 'META\t%s\t%s\n' "$k" "${META[$k]}"; done
+    for num in "${PHASE_NUMS[@]}"; do
+      printf 'PHASE\t%s\t%s\t%s\t%s\t%s\n' \
+        "$num" "${PH_STATUS[$num]}" "${PH_ATTEMPT[$num]}" "${PH_GATES[$num]}" "${PH_TITLE[$num]}"
+      for ((i = 1; i <= ${TK_COUNT[$num]:-0}; i++)); do
+        printf 'TASK\t%s\t%s\t%s\t%s\n' "$num" "$i" "${TK_STATUS[$num:$i]}" "${TK_TITLE[$num:$i]}"
+      done
+    done
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$RUN_STATE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+state_meta() { META[$1]="$2"; state_flush; }
+
+state_init() {
+  mkdir -p "$STATE_DIR"
+  : > "$LIVE_STATE"
+
+  META=(
+    [project]="$(basename "$(pwd)")"
+    [engine]="$ENGINE"
+    [input]="$INPUT_FILE"
+    [status]="running"
+    [started]="$(date +%s)"
+    [ended]=""
+    [pid]="$$"
+    [run]="run-$(date '+%m%d-%H%M%S')"
+    [cycle_max]="$MAX_CYCLES"
+    [test_cmd]="${TEST_CMD:-—}"
+    [phase_cur]=""
+    [cycle]=""
+    [gate]=""
+    [activity]=""
+    [last_error]=""
+    [note]=""
+  )
+
+  local file num title i t
+  while IFS='|' read -r file num title; do
+    PHASE_NUMS+=("$num")
+    PH_FILE[$num]="$file"
+    PH_TITLE[$num]="$title"
+    PH_ATTEMPT[$num]="0"
+    PH_GATES[$num]="pending pending pending pending"
+
+    if [ "$num" -lt "$FROM_PHASE" ]; then
+      PH_STATUS[$num]="skipped"
+    elif is_phase_done "$file"; then
+      PH_STATUS[$num]="done"
+    else
+      PH_STATUS[$num]="pending"
+    fi
+
+    i=0
+    while IFS= read -r t; do
+      i=$((i + 1))
+      TK_TITLE[$num:$i]="$t"
+      # Phase already finished in an earlier run: its tasks are done.
+      if [ "${PH_STATUS[$num]}" = "done" ]; then TK_STATUS[$num:$i]="done"
+      else TK_STATUS[$num:$i]="pending"; fi
+    done < <(phase_task_titles "$file")
+    TK_COUNT[$num]="$i"
+  done < <(manifest_entries)
+
+  META[phase_total]="${#PHASE_NUMS[@]}"
+  state_flush
+}
+
+# state_gate <phase> <index 0..3> <pending|run|pass|fail|skip>
+state_gate() {
+  local num="$1" idx="$2" val="$3"
+  local -a g
+  read -r -a g <<< "${PH_GATES[$num]}"
+  g[$idx]="$val"
+  PH_GATES[$num]="${g[*]}"
+  META[gate]="G$idx"
+  state_flush
+}
+
+state_phase_begin() {
+  local num="$1" cycle="$2"
+  PH_STATUS[$num]="running"
+  PH_ATTEMPT[$num]="$cycle"
+  PH_GATES[$num]="pending pending pending pending"
+  META[phase_cur]="$num"
+  META[cycle]="$cycle"
+  META[gate]=""
+  META[activity]="starting the engine session"
+  local i
+  for ((i = 1; i <= ${TK_COUNT[$num]:-0}; i++)); do
+    # In a fix cycle, tasks already confirmed by the verifier stay put.
+    [ "${TK_STATUS[$num:$i]}" = "done" ] || TK_STATUS[$num:$i]="pending"
+  done
+  : > "$LIVE_STATE"
+  state_flush
+}
+
+state_phase_end() {
+  local num="$1" status="$2"
+  PH_STATUS[$num]="$status"
+  META[activity]=""
+  if [ "$status" = "done" ]; then
+    local i
+    for ((i = 1; i <= ${TK_COUNT[$num]:-0}; i++)); do TK_STATUS[$num:$i]="done"; done
+  fi
+  state_flush
+}
+
+# Absorbs what the stream watcher saw, so the state survives the end of the
+# session (live.tsv is truncated on every new session).
+state_absorb_live() {
+  local num="$1" kind a b
+  [ -f "$LIVE_STATE" ] || return 0
+  while IFS=$'\t' read -r kind a b; do
+    [ "$kind" = "LIVE" ] || continue
+    [ -n "${TK_STATUS[$num:$a]+x}" ] || continue
+    [ "${TK_STATUS[$num:$a]}" = "done" ] && continue
+    TK_STATUS[$num:$a]="$b"
+  done < "$LIVE_STATE"
+  state_flush
+}
+
+# Gate 3's verdict is the truth about each task: it overrides whatever the
+# session thought it did.
+state_tasks_from_verify() {
+  local num="$1" verify_log="$2" n verdict line
+  [ -f "$verify_log" ] || return 0
+  while IFS= read -r line; do
+    n=$(sed -E 's/^TASK ([0-9]+):.*/\1/' <<< "$line")
+    verdict=$(sed -E 's/^TASK [0-9]+: ([A-Z]+).*/\1/' <<< "$line")
+    [ -n "${TK_STATUS[$num:$n]+x}" ] || continue
+    case "$verdict" in
+      DONE)       TK_STATUS[$num:$n]="done" ;;
+      INCOMPLETE) TK_STATUS[$num:$n]="incomplete" ;;
+    esac
+  done < <(sed 's/^[[:space:]]*//' "$verify_log" | grep -E '^TASK [0-9]+: (DONE|INCOMPLETE)' || true)
+  state_flush
+}
+
+# ---------------------------------------------------------------------------
+# Stream watcher (claude engine) — per-task progress in real time
+# ---------------------------------------------------------------------------
+#
+# Reads the JSONL from `claude --output-format stream-json` and translates it
+# into live.tsv. The agent's task list is the source: the prompt tells it to
+# create ONE task per `- [ ]` item of the phase, in the same order, and to mark
+# each one before and after. Supports both names seen in the CLI so far:
+# TaskCreate/TaskUpdate (2.x) and TodoWrite (earlier versions).
+#
+# Runs at the end of a pipe, hence in a subprocess: it only writes files, never
+# a variable of the parent. Always returns 0 — the engine's verdict is gate 0's.
+
+json_str() {
+  local line="$1" key="$2" v
+  [[ "$line" == *"\"$key\":\""* ]] || return 1
+  v="${line#*"\"$key\":\""}"
+  printf '%s' "${v%%\"*}"
+}
+
+# Free-form text (a shell command, a description) goes onto one line of the
+# panel: cut the value at \n / \" and clean up the orphan backslash left over
+# from the JSON escape, otherwise the activity shows up as `echo \`.
+json_text() {
+  local v
+  v=$(json_str "$1" "$2") || return 1
+  v="${v%%\\n*}"
+  v="${v%%\\t*}"
+  v="${v%"${v##*[!\\]}"}"
+  v="${v//  / }"
+  printf '%s' "$v"
+}
+
+agent_status_to_ralph() {
+  case "$1" in
+    in_progress) printf 'running' ;;
+    completed)   printf 'done' ;;
+    *)           printf 'pending' ;;
+  esac
+}
+
+# stream_watch <live_file> <phase_num> <quiet> [phase_file]
+#
+# Primary source: the agent's task list. Fallback source: the files it writes —
+# not every model uses the list, and without a fallback the panel would show
+# everything "pending" through an entire phase that is clearly making progress.
+stream_watch() {
+  local live="$1" phase_num="$2" quiet="$3" phase_file="${4:-}"
+  local -A st=() idx_of=()
+  local -a pending_create=() task_titles=()
+  local -a decl_task=() decl_lvl=() decl_path=()
+  local next=0 activity="" line tool val tid status idx
+  local agent_list_used=0 inferred_max=0 marker_used=0
+
+  # Task titles, to match a file path -> task.
+  if [ -n "$phase_file" ]; then
+    while IFS= read -r val; do task_titles+=("$val"); done < <(phase_task_titles "$phase_file")
+    # Files declared per task: the strong signal, when the plan declares them.
+    while IFS=$'\t' read -r val status tool; do
+      [ -n "${tool:-}" ] || continue
+      decl_task+=("$val"); decl_lvl+=("$status"); decl_path+=("$tool")
+    done < <(phase_task_files "$phase_file")
+    status=""; tool=""; val=""
+  fi
+
+  # Which task does this file belong to?
+  #
+  # 1) path declared by the task itself ("Files: `app/Models/X.php`") — the
+  #    agent edits with an absolute path, so matching as a suffix is enough;
+  # 2) same file name among the declared ones;
+  # 3) path mentioned elsewhere in the task body (a reference);
+  # 4) the task's own text mentioning the path or the file name.
+  #
+  # The order matters: a task's body often cites files belonging to other tasks
+  # (the model to mirror, the test that covers it), and matching on those first
+  # would throw progress onto the wrong task.
+  sw_task_for_file() {
+    local path="$1" base i t lvl
+    base=$(basename -- "$path")
+    for lvl in 1 2; do
+      for i in "${!decl_path[@]}"; do
+        [ "${decl_lvl[$i]}" = "$lvl" ] || continue
+        t="${decl_path[$i]}"
+        if [ "$path" = "$t" ] || [[ "$path" == *"/$t" ]]; then
+          printf '%s' "${decl_task[$i]}"; return 0
+        fi
+      done
+      [ "$lvl" = "1" ] || continue
+      for i in "${!decl_path[@]}"; do
+        [ "${decl_lvl[$i]}" = "1" ] || continue
+        [ "$(basename -- "${decl_path[$i]}")" = "$base" ] || continue
+        printf '%s' "${decl_task[$i]}"; return 0
+      done
+    done
+    for i in "${!task_titles[@]}"; do
+      t="${task_titles[$i]}"
+      if [[ "$t" == *"$path"* ]] || [[ "$t" == *"$base"* ]]; then
+        printf '%s' $((i + 1))
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  # Fallback: the agent wrote task N's file. Mark N as running and count ALL
+  # the earlier ones as done — including those that never matched a file. Not
+  # every task cites one: "add the plus/minus/times operations to App\Money" is
+  # done inside the previous task's file. Promoting only the ones that were
+  # touched left those pending until the end of the phase, and the panel jumped
+  # from "Pending" straight to "Done", as if they had never run.
+  #
+  # It is a guess based on the order the agent works in; gate 3 corrects it at
+  # the end of the phase, and a task genuinely not done comes back INCOMPLETE.
+  sw_infer_from_file() {
+    local path="$1" n i
+    [ "$agent_list_used" -eq 1 ] && return 0
+    n=$(sw_task_for_file "$path") || return 0
+    for ((i = 1; i < n; i++)); do
+      st["$i"]="done"
+    done
+    [ "${st[$n]:-}" = "done" ] || st["$n"]="running"
+    [ "$n" -gt "$inferred_max" ] && inferred_max="$n"
+    return 0
+  }
+
+  sw_flush() {
+    local tmp="$live.$$" k
+    {
+      printf 'PHASE\t%s\n' "$phase_num"
+      printf 'ACTIVITY\t%s\n' "$activity"
+      for k in "${!st[@]}"; do printf 'LIVE\t%s\t%s\n' "$k" "${st[$k]}"; done
+    } > "$tmp" 2>/dev/null && mv -f "$tmp" "$live" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  }
+
+  sw_say() {
+    [ "$quiet" = "1" ] && return 0
+    echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC}   $1"
+  }
+
+  # RALPH-TASK <n> START|DONE markers emitted by the agent as plain text. They
+  # are the primary source: unlike the task list, they exist in a headless
+  # session (where TaskCreate/TodoWrite simply are not available, even after the
+  # agent tries to load them via ToolSearch).
+  sw_markers() {
+    local raw="$1" m n verb hit=0 i
+    # `|| [ -n "$m" ]`: the last match can arrive without a trailing newline
+    while IFS= read -r m || [ -n "$m" ]; do
+      [ -n "$m" ] || continue
+      n="${m#RALPH-TASK }"; n="${n%% *}"
+      verb="${m##* }"
+      [[ "$n" =~ ^[0-9]+$ ]] || continue
+      if [ "$marker_used" -eq 0 ]; then
+        # the text protocol has taken over: discard what the fallback inferred
+        marker_used=1
+        st=()
+      fi
+      case "$verb" in
+        START)
+          # the earlier ones count as done: the agent works in order and does
+          # not emit DONE for every one when it runs items together
+          for ((i = 1; i < n; i++)); do [ -n "${st[$i]:-}" ] || st["$i"]="done"; done
+          [ "${st[$n]:-}" = "done" ] || st["$n"]="running"
+          sw_say "task $n running"
+          ;;
+        DONE)
+          st["$n"]="done"
+          sw_say "task $n done"
+          ;;
+      esac
+      hit=1
+    done < <(grep -oE 'RALPH-TASK[[:space:]]+[0-9]+[[:space:]]+(START|DONE)' <<< "$raw" \
+             | tr -s '[:blank:]' ' ' || true)
+    [ "$hit" -eq 1 ] && sw_flush
+    return 0
+  }
+
+  # Immediate sign of life: the session has started, so the first item is
+  # running. Without this the whole phase showed as "Pending" until the first
+  # recognised event — which, with no task list, might never arrive.
+  st[1]="running"
+  sw_flush
+
+  while IFS= read -r line; do
+    # markers can arrive in any assistant text block
+    case "$line" in
+      *RALPH-TASK*) sw_markers "$line" ;;
+    esac
+    [ "$marker_used" -eq 1 ] && agent_list_used=1   # the per-file fallback goes quiet
+    case "$line" in
+      # --- task list: TaskCreate / TaskUpdate (CLI 2.x) ---------------------
+      *'"name":"TaskCreate"'*)
+        val=$(json_str "$line" subject) || val=""
+        pending_create+=("$val")
+        activity="planning: $val"
+        # The agent's list has taken over: discard what the fallback inferred.
+        if [ "$agent_list_used" -eq 0 ]; then
+          agent_list_used=1
+          st=()
+        fi
+        sw_flush
+        ;;
+      *'"task":{"id":"'*)
+        val="${line#*'"task":{"id":"'}"; val="${val%%\"*}"
+        next=$((next + 1))
+        idx_of["$val"]="$next"
+        st["$next"]="pending"
+        [ ${#pending_create[@]} -gt 0 ] && pending_create=("${pending_create[@]:1}")
+        sw_flush
+        ;;
+      *'"name":"TaskUpdate"'*)
+        tid=$(json_str "$line" taskId) || tid=""
+        status=$(json_str "$line" status) || status=""
+        idx="${idx_of[$tid]:-$tid}"
+        if [[ "$idx" =~ ^[0-9]+$ ]] && [ -n "$status" ]; then
+          st["$idx"]=$(agent_status_to_ralph "$status")
+          case "$status" in
+            in_progress) sw_say "task $idx running" ;;
+            completed)   sw_say "task $idx done" ;;
+          esac
+          sw_flush
+        fi
+        ;;
+      # --- task list: TodoWrite (earlier CLI) -------------------------------
+      *'"name":"TodoWrite"'*)
+        local rest="$line" chunk i2=0
+        agent_list_used=1
+        st=()
+        while [[ "$rest" == *'"status":"'* ]]; do
+          chunk="${rest#*'"status":"'}"
+          status="${chunk%%\"*}"
+          i2=$((i2 + 1))
+          st["$i2"]=$(agent_status_to_ralph "$status")
+          rest="$chunk"
+        done
+        activity="updated the task list"
+        sw_flush
+        ;;
+      # --- current activity -------------------------------------------------
+      *'"type":"tool_use"'*)
+        tool=$(json_str "$line" name) || tool=""
+        case "$tool" in
+          Bash)
+            val=$(json_text "$line" description) || val=$(json_text "$line" command) || val=""
+            activity="bash: ${val:0:60}"
+            ;;
+          Edit|Write|NotebookEdit)
+            val=$(json_str "$line" file_path) || val=""
+            activity="$tool: $(basename -- "${val:-?}")"
+            [ -n "$val" ] && sw_infer_from_file "$val"
+            ;;
+          Read|Glob|Grep)
+            activity="reading the project ($tool)"
+            ;;
+          ToolSearch|"") ;;
+          *) activity="$tool" ;;
+        esac
+        sw_flush
+        ;;
+    esac
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Prompts (self-contained — every session is new)
 # ---------------------------------------------------------------------------
 
@@ -536,6 +1076,39 @@ PREAMBLE
   fi
 }
 
+# The panel follows the phase task by task by reading the transitions of the
+# agent's task list off the stream. Without this block ralph only knows "phase
+# running" and per-task progress sits still until gate 3.
+# Only meaningful on claude: codex exposes no equivalent stream.
+task_protocol_block() {
+  [[ "$ENGINE" == "claude" ]] || return 0
+  cat <<'PROTO'
+
+## Progress protocol (mandatory)
+An external orchestrator reads your output in real time to show the human
+operator which item of this phase you are on. The channel is PLAIN TEXT and
+depends on no tool at all: write, as a line on its own in your response,
+
+    RALPH-TASK <n> START     before starting item n
+    RALPH-TASK <n> DONE      once the code AND the tests for item n are ready
+
+where `<n>` is the position of the `- [ ]` item in this phase (1 for the first,
+2 for the second, and so on — do not use the T03/T12 code from the text).
+
+Rules:
+- work on one item at a time, in order;
+- emit the START before the first edit of that item, and the DONE only when it
+  is genuinely ready;
+- do not emit DONE for an item you did not implement;
+- both lines are mandatory even when the item is small.
+
+If your session has a task-list tool (TaskCreate/TaskUpdate or TodoWrite), use
+it as well, with one task per item in the same order — but the `RALPH-TASK`
+lines stay mandatory: in a headless session that tool usually does not exist,
+and without the lines the operator is blind for the whole phase.
+PROTO
+}
+
 build_impl_prompt() {
   local phase_file="$1" cycle="$2"
   local prompt_file="$PROMPT_DIR/${phase_file%.md}.cycle-${cycle}.txt"
@@ -544,6 +1117,7 @@ build_impl_prompt() {
     echo "You are a senior developer implementing a phase of this project."
     echo
     context_preamble
+    task_protocol_block
     cat <<'TASK'
 
 ## Your task now
@@ -582,6 +1156,7 @@ build_fix_prompt() {
     echo "You are a senior developer fixing a partially implemented phase."
     echo
     context_preamble
+    task_protocol_block
     cat <<'INTRO'
 
 ## Situation
@@ -632,6 +1207,23 @@ Rules:
 - Missing code, TODO, placeholder, or missing test => INCOMPLETE.
 - When in doubt, INCOMPLETE.
 
+Execution (headless — read carefully):
+- You run in a non-interactive session: the process DIES when this turn ends.
+  There is no next turn, and no notification of a completed task.
+- NEVER run anything in the background (`run_in_background`, `&`, `nohup`) and
+  never wait for a completion notification. The result will never arrive and the
+  phase will be failed for missing TASK lines.
+- Run commands only SYNCHRONOUSLY and only if they are fast (seconds):
+  `grep`, `ls`, `route:list`, `schedule:list`, `test --filter=<File>`.
+- Do NOT run the full suite (`artisan test` with no filter): it takes tens of
+  minutes and does not fit in this gate. For tasks whose criterion is "suite
+  green", verify via the EXISTENCE and the CONTENT of the required tests and via
+  the phase's own test log, and issue the verdict on that basis.
+- Emitting the TASK lines is the LAST thing you do and it is MANDATORY. Ending
+  the turn without them fails the phase, even if the code is correct. If you ran
+  out of evidence for some task, emit INCOMPLETE for it — never end the turn
+  announcing that you are going to wait for something.
+
 ## Phase to verify
 VERIFY
     cat "$PHASES_DIR/$phase_file"
@@ -648,16 +1240,23 @@ VERIFY
 # Returns 0 when a limit is detected, 1 when there is no limit.
 detect_usage_limit() {
   local log_file="$1"
-  local tail_txt pattern epoch
+  local tail_txt pattern epoch human now
 
   # The limit message appears at the END of the run. Scanning the whole log makes
   # project test output ("429", "Too Many Requests") trigger a bogus 30min wait.
   tail_txt=$(tail -n 20 "$log_file" 2>/dev/null || true)
 
+  # Claude Code has no single limit message. Seen so far:
+  #   "Claude AI usage limit reached|1753362600"          (raw epoch)
+  #   "You've hit your session limit · resets 11:10am"    (human time)
+  #   "5-hour limit reached"
+  # The common denominator is api_error_status 429 in the result JSON — matching
+  # only the phrase lets the limit slip through gate 0 and burns every fix cycle
+  # in seconds, which is exactly what invariant 4 prevents.
   if [[ "$ENGINE" == "claude" ]]; then
-    pattern='usage limit reached'
+    pattern='usage limit reached|hit your (session|usage|[0-9]+-hour) limit|[0-9]+-hour limit reached|"api_error_status"[[:space:]]*:[[:space:]]*429'
   else
-    pattern='rate limit reached|quota exceeded|usage limit reached'
+    pattern='rate limit reached|quota exceeded|usage limit reached|too many requests'
   fi
 
   grep -qiE "$pattern" <<< "$tail_txt" || return 1
@@ -670,6 +1269,19 @@ detect_usage_limit() {
       | grep -oE '[0-9]{10,13}' | tail -1 || true)
   fi
 
+  # Human time ("resets 11:10am", "resets at 3pm"): resolve to the next
+  # occurrence. Without this the run falls back to 30min despite knowing the time.
+  if [ -z "$epoch" ]; then
+    human=$(grep -oiE 'resets?[[:space:]]+(at[[:space:]]+)?[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' <<< "$tail_txt" \
+      | grep -oiE '[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' | tail -1 || true)
+    if [ -n "$human" ]; then
+      epoch=$(date -d "$human" +%s 2>/dev/null || true)
+      now=$(date +%s)
+      if [ -n "$epoch" ] && [ "$epoch" -le "$now" ]; then
+        epoch=$(date -d "tomorrow $human" +%s 2>/dev/null || echo "$epoch")
+      fi
+    fi
+  fi
   echo "${epoch:-0}"
   return 0
 }
@@ -702,14 +1314,18 @@ wait_for_reset() {
 
   warn "Wait $LIMIT_WAITS/$MAX_LIMIT_WAITS — waiting $(format_duration "$wait_secs") before resuming the SAME phase..."
 
+  META[status]="waiting"
   local remaining=$wait_secs chunk
   while [ "$remaining" -gt 0 ]; do
     chunk=60
     [ "$remaining" -lt 60 ] && chunk=$remaining
+    state_meta activity "usage limit — resuming in $(format_duration "$remaining")"
     sleep "$chunk"
     remaining=$((remaining - chunk))
     [ "$remaining" -gt 0 ] && log "Resuming in $(format_duration "$remaining")..."
   done
+  META[status]="running"
+  state_meta activity "resuming the phase"
 
   success "Reset likely complete. Resuming execution."
 }
@@ -750,10 +1366,21 @@ run_engine() {
           --allowedTools "Read,Glob,Grep" \
           --output-format text < /dev/null 2>&1 | tee "$log_file" || rc=$?
       else
-        # JSON: the CLI's exit code is a weak signal; gate 0 reads is_error.
-        env -u CLAUDECODE claude --dangerously-skip-permissions \
-          -p "$(cat "$prompt_file")" \
-          --output-format json < /dev/null 2>&1 | tee "$log_file" || rc=$?
+        # stream-json: events line by line WHILE the session runs — that is
+        # what gives the panel per-task progress. The result JSON is still the
+        # last line, with "type":"result" and is_error: gate 0 does not change.
+        # The CLI's exit code is a weak signal; gate 0 is what decides.
+        local quiet=0
+        $DASHBOARD && quiet=1
+        if env -u CLAUDECODE claude --dangerously-skip-permissions \
+             -p "$(cat "$prompt_file")" \
+             --output-format stream-json --verbose < /dev/null 2>&1 \
+             | tee "$log_file" \
+             | stream_watch "$LIVE_STATE" "${RALPH_PHASE_NUM:-0}" "$quiet" "$CURRENT_PHASE_FILE"; then
+          rc=0
+        else
+          rc=$?
+        fi
       fi
     fi
 
@@ -779,12 +1406,22 @@ gate0_engine_finished() {
   local log_file="$1" rc="$2"
 
   if [[ "$ENGINE" == "claude" ]]; then
-    if ! grep -qF '"type":"result"' "$log_file" && ! grep -qF '"type": "result"' "$log_file"; then
+    # is_error has to come from the RESULT EVENT, never from the whole log.
+    # With --output-format stream-json the log carries the entire conversation,
+    # and a tool_result from a failed tool (a grep with no match, a red test, an
+    # ls of a missing file) also carries "is_error":true. That is normal agent
+    # work, not an engine failure: scanning the whole file failed the entire
+    # phase because of one command that returned 1.
+    local result_line
+    result_line=$(grep -F '"type":"result"' "$log_file" | tail -n 1)
+    [ -z "$result_line" ] && result_line=$(grep -F '"type": "result"' "$log_file" | tail -n 1)
+
+    if [ -z "$result_line" ]; then
       GATE_CAUSE="The engine ended without emitting a result. Last lines of the output:"$'\n'"$(tail -n 40 "$log_file")"
       return 1
     fi
-    if grep -qE '"is_error"[[:space:]]*:[[:space:]]*true' "$log_file"; then
-      GATE_CAUSE="The engine reported is_error=true. Last lines of the output:"$'\n'"$(tail -n 40 "$log_file")"
+    if grep -qE '"is_error"[[:space:]]*:[[:space:]]*true' <<< "$result_line"; then
+      GATE_CAUSE="The engine reported is_error=true in the result. Last lines of the output:"$'\n'"$(tail -n 40 "$log_file")"
       return 1
     fi
   fi
@@ -948,6 +1585,7 @@ run_phase() {
   export RALPH_PHASE_TITLE="$phase_title"
   export RALPH_PHASE_NUM="$phase_num"
   export RALPH_PHASE_TOTAL="$total"
+  CURRENT_PHASE_FILE="$phase_file"
 
   LIMIT_WAITS=0
   GATE_CAUSE=""
@@ -959,6 +1597,8 @@ run_phase() {
   while [ "$cycle" -le "$MAX_CYCLES" ]; do
     export RALPH_PHASE_ATTEMPT="$cycle"
     [ "$cycle" -gt 1 ] && warn "Fix cycle $cycle/$MAX_CYCLES..."
+
+    state_phase_begin "$phase_num" "$cycle"
 
     local prompt_file log_file rc=0 sig_before
     log_file="$LOG_DIR/${phase_file%.md}.cycle-${cycle}.log"
@@ -972,6 +1612,8 @@ run_phase() {
     sig_before=$(tree_signature)
     run_engine "$prompt_file" "$log_file" impl || rc=$?
 
+    state_absorb_live "$phase_num"
+    state_meta activity "avaliando os gates"
     GATE_CAUSE=""
 
     # Gate 1 is a signal, not a verdict: a phase already implemented makes the
@@ -985,17 +1627,51 @@ run_phase() {
       warn "Gate 1 — the session wrote nothing; validating the existing code"
     fi
 
+    # The panel mirrors each gate as it runs. The order is the same as the
+    # evaluation: whichever fails stops the chain and becomes a fix cycle.
+    local verify_log="$LOG_DIR/${phase_file%.md}.verify-${cycle}.log"
+    local gate_verdict="green"
+
     if ! gate0_engine_finished "$log_file" "$rc"; then
+      state_gate "$phase_num" 0 fail
       LAST_GATE="gate 0 — engine did not finish"
       fail "Gate 0 red"
-    elif ! gate2_tests_pass "$LOG_DIR/${phase_file%.md}.test-${cycle}.log"; then
-      LAST_GATE="gate 2 — project test suite"
-      GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
-      fail "Gate 2 red — project tests failed"
-    elif ! gate3_independent_verify "$phase_file" "$cycle" "$session_wrote"; then
-      LAST_GATE="gate 3 — independent verification"
-      GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
-      fail "Gate 3 red — incomplete implementation"
+      gate_verdict="red"
+    else
+      state_gate "$phase_num" 0 pass
+      if [ "$session_wrote" -eq 1 ]; then state_gate "$phase_num" 1 pass
+      else state_gate "$phase_num" 1 skip; fi
+
+      if [ -n "$TEST_CMD" ]; then state_gate "$phase_num" 2 run; else state_gate "$phase_num" 2 skip; fi
+
+      if ! gate2_tests_pass "$LOG_DIR/${phase_file%.md}.test-${cycle}.log"; then
+        state_gate "$phase_num" 2 fail
+        LAST_GATE="gate 2 — project test suite"
+        GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
+        fail "Gate 2 red — project tests failed"
+        gate_verdict="red"
+      else
+        [ -n "$TEST_CMD" ] && state_gate "$phase_num" 2 pass
+        state_gate "$phase_num" 3 run
+        state_meta activity "independent verifier reading the code"
+
+        if ! gate3_independent_verify "$phase_file" "$cycle" "$session_wrote"; then
+          state_tasks_from_verify "$phase_num" "$verify_log"
+          state_gate "$phase_num" 3 fail
+          LAST_GATE="gate 3 — independent verification"
+          GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
+          fail "Gate 3 red — incomplete implementation"
+          gate_verdict="red"
+        else
+          state_tasks_from_verify "$phase_num" "$verify_log"
+          if [ "$GATE3_RAN" -eq 1 ]; then state_gate "$phase_num" 3 pass
+          else state_gate "$phase_num" 3 skip; fi
+        fi
+      fi
+    fi
+
+    if [ "$gate_verdict" = "red" ]; then
+      state_meta last_error "$(printf '%s' "$GATE_CAUSE" | head -n 1 | cut -c1-70)"
     else
       local phase_duration=$(($(date +%s) - phase_start))
 
@@ -1009,15 +1685,18 @@ run_phase() {
           log "Gate 2 green against the code on HEAD; no commit created."
         fi
         mark_phase_done "$phase_file"
+        state_phase_end "$phase_num" done
         return 0
       fi
 
       success "Phase $phase_num: $phase_title — COMPLETE ($(format_duration "$phase_duration"))"
       if ! commit_phase "$phase_num" "$phase_title"; then
         LAST_GATE="commit"
+        state_phase_end "$phase_num" failed
         return 1
       fi
       mark_phase_done "$phase_file"
+      state_phase_end "$phase_num" done
       return 0
     fi
 
@@ -1025,6 +1704,7 @@ run_phase() {
   done
 
   local phase_duration=$(($(date +%s) - phase_start))
+  state_phase_end "$phase_num" failed
   fail "Phase $phase_num: $phase_title — FAILED after $MAX_CYCLES cycles ($(format_duration "$phase_duration"))"
   fail "Last cause ($LAST_GATE):"
   printf '%s\n' "$GATE_CAUSE" | head -n 20 | sed 's/^/    /'
@@ -1040,6 +1720,65 @@ run_phase() {
 }
 
 # ---------------------------------------------------------------------------
+# Built-in dashboard (--dashboard)
+# ---------------------------------------------------------------------------
+#
+# The panel is ralph-watch.sh, the same one that runs in another terminal — here
+# it is merely started in the background and told to draw on the alternate
+# screen. Keeping a single renderer avoids two implementations of the same
+# layout drifting apart.
+#
+# ralph.sh keeps working on its own: without ralph-watch.sh next to it,
+# --dashboard degrades to log mode with a warning.
+
+DASH_PID=""
+
+start_dashboard() {
+  $DASHBOARD || return 0
+
+  local watch
+  watch="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ralph-watch.sh"
+
+  if [ ! -f "$watch" ]; then
+    warn "--dashboard requested, but $watch does not exist. Continuing with the normal log."
+    warn "State is still published to $RUN_STATE — you can follow along from another terminal."
+    DASHBOARD=false
+    return 0
+  fi
+
+  mkdir -p "$LOG_DIR"
+  : > "$RALPH_LOG"
+  LOG_SINK="$RALPH_LOG"
+
+  tput smcup 2>/dev/null || true
+  bash "$watch" --embedded . &
+  DASH_PID=$!
+}
+
+stop_dashboard() {
+  [ -n "$DASH_PID" ] || return 0
+  kill "$DASH_PID" 2>/dev/null || true
+  wait "$DASH_PID" 2>/dev/null || true
+  DASH_PID=""
+  tput rmcup 2>/dev/null || true
+  tput cnorm 2>/dev/null || true
+  LOG_SINK=""
+}
+
+# Without this, a Ctrl-C in the middle of a run leaves the terminal on the
+# alternate screen with no cursor.
+on_exit() {
+  local code=$?
+  if [ -n "${META[status]:-}" ] && [ "${META[status]}" = "running" ]; then
+    META[status]="failed"
+    META[ended]="$(date +%s)"
+    state_flush
+  fi
+  stop_dashboard
+  exit "$code"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1049,6 +1788,9 @@ main() {
   preflight_checks
   split_phases
   apply_from_override
+  state_init
+  trap on_exit EXIT INT TERM
+  start_dashboard
 
   local total_phases
   total_phases=$(manifest_entries | wc -l)
@@ -1123,6 +1865,20 @@ main() {
   end_time=$(date +%s)
   total_duration=$((end_time - start_time))
 
+  META[ended]="$end_time"
+  META[activity]=""
+  META[gate]=""
+  if [ ${#failed_phases[@]} -eq 0 ]; then META[status]="finished"; else META[status]="failed"; fi
+  # live.tsv belongs to the session, not the run: keeping it would make the
+  # panel show forever the last action of a session that already ended.
+  : > "$LIVE_STATE"
+  state_flush
+
+  # The panel goes away with the alternate screen: the final report has to be
+  # printed after it, on the real terminal, otherwise the run ends leaving no
+  # trace in the scrollback.
+  stop_dashboard
+
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   log "FINAL REPORT (engine: $ENGINE)"
@@ -1158,4 +1914,7 @@ main() {
   [ ${#failed_phases[@]} -eq 0 ] || exit 1
 }
 
-main
+# RALPH_LIB_ONLY=1 loads the functions without executing the run — the suite
+# uses this to test units (e.g. stream_watch) without standing up a whole
+# fixture repo.
+[ "${RALPH_LIB_ONLY:-0}" = "1" ] || main
