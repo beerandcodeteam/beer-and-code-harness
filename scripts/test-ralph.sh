@@ -274,8 +274,14 @@ Projeto de teste.
 '
 
 # Fixture de projeto Laravel + Sail. `sail ps` responde conforme SAIL_UP.
+# compose: "compose" (default) cria compose.yaml; "no-compose" deixa so o pacote
+# — o caso do esqueleto do Laravel, que traz laravel/sail sem usar containers.
 make_sail_fixture() {
-  local repo="$1" up="$2"
+  local repo="$1" up="$2" compose="${3:-compose}"
+
+  if [ "$compose" = "compose" ]; then
+    printf 'services:\n  laravel.test:\n    image: sail-8.3/app\n' > "$repo/compose.yaml"
+  fi
 
   touch "$repo/artisan"
   cat > "$repo/composer.json" <<'JSON'
@@ -336,7 +342,11 @@ run_ralph() {
     # -u RALPH_TEST_CMD / RALPH_MAX_CYCLES: o dev pode ter essas exportadas no
     # shell (ex: RALPH_TEST_CMD no .zshrc). Herda-las aqui sobrepoe a deteccao
     # por manifest e quebra os casos 13/16 com uma falha que nao existe no ralph.
+    # BC_HARNESS_SAIL / SAIL_FILES / COMPOSE_FILE: idem, mudam a deteccao do
+    # Sail; o caso escolhe o modo via CASE_SAIL.
     env -u RALPH_TEST_CMD -u RALPH_MAX_CYCLES -u RALPH_MAX_LIMIT_WAITS \
+        -u SAIL_FILES -u COMPOSE_FILE \
+    BC_HARNESS_SAIL="${CASE_SAIL:-auto}" \
     PATH="$dir/bin:$PATH" \
     MOCK_STATE="$dir/state" \
     MOCK_SCENARIO="$scenario" \
@@ -718,6 +728,77 @@ if case_enabled laravel-no-sail; then
   run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
   assert_contains "$d/out.log" "comando de teste (detectado): composer test" "sem sail -> composer test"
   assert_not_contains "$d/out.log" "Sail" "nao mencionou Sail"
+fi
+
+# ---------------------------------------------------------------------------
+# 38. laravel/sail instalado SEM compose (esqueleto do Laravel, app no host)
+#     -> nao e Sail: composer test, prompt sem a regra do container
+# ---------------------------------------------------------------------------
+if case_enabled sail-no-compose; then
+  header "38. Sail instalado sem compose -> tratado como Laravel sem Sail"
+  d=$(new_case sail-no-compose)
+  make_sail_fixture "$d/repo" down no-compose   # sail ps falharia se consultado
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail sem compose"
+  run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
+  assert_contains "$d/out.log" "comando de teste (detectado): composer test" "sem compose -> composer test"
+  assert_not_contains "$d/out.log" "vendor/bin/sail test" "sail test nao foi escolhido"
+  assert_not_contains "$d/out.log" "containers nao estao de pe" "nao checou containers"
+  assert_contains "$d/out.log" "sem arquivo de compose" "explicou por que ignorou o Sail"
+  assert_not_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "Nunca rode essas ferramentas no host" "prompt nao manda usar container"
+fi
+
+# ---------------------------------------------------------------------------
+# 39. Variantes de compose que o sail/docker compose aceitam -> Sail
+# ---------------------------------------------------------------------------
+if case_enabled sail-compose-variants; then
+  header "39. docker-compose.yml / SAIL_FILES no .env -> Sail detectado"
+  d=$(new_case sail-compose-yml)
+  make_sail_fixture "$d/repo" up no-compose
+  printf 'services: {}\n' > "$d/repo/docker-compose.yml"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
+  assert_contains "$d/out.log" "comando de teste (detectado): vendor/bin/sail test" "docker-compose.yml -> sail test"
+
+  d=$(new_case sail-files-env)
+  make_sail_fixture "$d/repo" up no-compose
+  printf 'APP_NAME=x\nSAIL_FILES=docker/compose.dev.yaml\n' > "$d/repo/.env"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
+  assert_contains "$d/out.log" "comando de teste (detectado): vendor/bin/sail test" "SAIL_FILES no .env -> sail test"
+
+  d=$(new_case sail-files-commented)
+  make_sail_fixture "$d/repo" up no-compose
+  printf '# SAIL_FILES=docker/compose.dev.yaml\nCOMPOSE_FILE=\n' > "$d/repo/.env"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
+  assert_contains "$d/out.log" "comando de teste (detectado): composer test" "comentado/vazio no .env nao conta"
+fi
+
+# ---------------------------------------------------------------------------
+# 40. BC_HARNESS_SAIL sobrepoe a deteccao nos dois sentidos
+# ---------------------------------------------------------------------------
+if case_enabled sail-mode; then
+  header "40. BC_HARNESS_SAIL=off/on/invalido"
+  d=$(new_case sail-mode-off)
+  make_sail_fixture "$d/repo" down          # compose presente, containers parados
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  CASE_SAIL=off run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
+  assert_contains "$d/out.log" "comando de teste (detectado): composer test" "off -> composer test mesmo com compose"
+  assert_not_contains "$d/out.log" "containers nao estao de pe" "off -> nao checou containers"
+
+  d=$(new_case sail-mode-on)
+  make_sail_fixture "$d/repo" up no-compose
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  CASE_SAIL=on run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
+  assert_contains "$d/out.log" "comando de teste (detectado): vendor/bin/sail test" "on -> sail test sem compose"
+
+  d=$(new_case sail-mode-bad)
+  make_sail_fixture "$d/repo" up
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  rc=$(CASE_SAIL=sim run_ralph "$d" ok --engine claude)
+  assert_eq 1 "$rc" "valor invalido -> exit 1"
+  assert_contains "$d/out.log" "Valor invalido para BC_HARNESS_SAIL" "abortou com a causa"
+  test -f "$d/state/impl_calls" && bad "nenhuma sessao de engine iniciada" || ok "nenhuma sessao de engine iniciada"
 fi
 
 # ---------------------------------------------------------------------------

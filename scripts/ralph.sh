@@ -75,7 +75,7 @@
 #   1. --test-cmd "<cmd>"
 #   2. RALPH_TEST_CMD
 #   3. deteccao por manifest:
-#        Laravel Sail (artisan + vendor/bin/sail)  -> vendor/bin/sail test
+#        Laravel Sail (artisan + sail + compose)   -> vendor/bin/sail test
 #        composer.json com scripts.test            -> composer test
 #        artisan                                   -> php artisan test
 #        package.json com scripts.test             -> npm test
@@ -87,9 +87,15 @@
 # Laravel Sail: a suite roda dentro do container, entao Sail tem precedencia
 # sobre `composer test`. Containers parados -> abort no preflight (todo gate 2
 # falharia, queimando ciclos de correcao).
+# Ter o pacote laravel/sail nao basta: o esqueleto do Laravel o traz em
+# require-dev. Sail so conta com um arquivo de compose na raiz (compose.yaml,
+# compose.yml, docker-compose.yaml, docker-compose.yml) ou SAIL_FILES /
+# COMPOSE_FILE definidos — sem compose o proprio sail nao sobe nada.
+# BC_HARNESS_SAIL=on|off sobrepoe a deteccao (default: auto).
 #
 # Variaveis de ambiente:
 #   RALPH_TEST_CMD           comando de teste (gate 2); --test-cmd tem prioridade
+#   BC_HARNESS_SAIL          deteccao do Laravel Sail: auto (default) | on | off
 #   RALPH_VERIFY             gate 3: always (default) | auto | off
 #   RALPH_VERIFY_MODEL       modelo do verificador (default: sonnet no claude)
 #   RALPH_MAX_CYCLES         ciclos de correcao por fase (default: 3)
@@ -121,6 +127,7 @@ KEEP_GOING=false
 TEST_CMD_FLAG=""
 MAX_CYCLES="${RALPH_MAX_CYCLES:-3}"
 VERIFY_MODE="${RALPH_VERIFY:-always}"
+SAIL_MODE="${BC_HARNESS_SAIL:-auto}"
 VERIFY_MODEL=""
 DASHBOARD=false
 
@@ -250,19 +257,33 @@ exclude_phases_dir() {
 
 # Laravel Sail: a suite roda DENTRO do container. Rodar `composer test` /
 # `php artisan test` no host falha (sem PHP, sem banco, sem rede do compose).
+
+# Pacote laravel/sail presente (instalado, ou declarado com vendor/ ausente).
+sail_installed() {
+  [ -x vendor/bin/sail ] && return 0
+  [ -f composer.json ] && grep -qF 'laravel/sail' composer.json
+}
+
+# Ha compose para o sail subir? Mesma regra do sail-guard.sh. O sail le
+# SAIL_FILES do ambiente ou do .env; o docker compose le COMPOSE_FILE idem.
+sail_has_compose() {
+  local f
+  for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    [ -f "$f" ] && return 0
+  done
+  [ -n "${SAIL_FILES:-}" ] || [ -n "${COMPOSE_FILE:-}" ] && return 0
+  [ -f .env ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?(SAIL_FILES|COMPOSE_FILE)=("[^"]+"|'"'"'[^'"'"']+'"'"'|[^[:space:]#"'"'"'])' .env
+}
+
 # Ecoa o caminho do binario sail quando o projeto usa Sail.
 detect_sail() {
+  [ "$SAIL_MODE" = "off" ] && return 1
   [ -f artisan ] || return 1
-  if [ -x vendor/bin/sail ]; then
-    echo "vendor/bin/sail"
-    return 0
+  sail_installed || return 1
+  if [ "$SAIL_MODE" = "auto" ] && ! sail_has_compose; then
+    return 1
   fi
-  # Sail declarado no composer.json mas vendor/ ainda nao instalado.
-  if [ -f composer.json ] && grep -qF 'laravel/sail' composer.json; then
-    echo "vendor/bin/sail"
-    return 0
-  fi
-  return 1
+  echo "vendor/bin/sail"
 }
 
 # Containers de pe? O wrapper do sail imprime "Sail is not running." e sai != 0.
@@ -341,6 +362,9 @@ check_test_cmd_runnable() {
 
 resolve_test_cmd() {
   SAIL_BIN="$(detect_sail || true)"
+  if [ -z "$SAIL_BIN" ] && [ "$SAIL_MODE" = "auto" ] && [ -f artisan ] && sail_installed; then
+    log "laravel/sail presente, mas sem arquivo de compose: projeto tratado como Laravel sem Sail (BC_HARNESS_SAIL=on forca o Sail)"
+  fi
 
   if [ -n "$TEST_CMD_FLAG" ]; then
     TEST_CMD="$TEST_CMD_FLAG"
@@ -410,6 +434,14 @@ preflight_checks() {
     auto|always|off) ;;
     *)
       fail "Valor invalido para RALPH_VERIFY: '$VERIFY_MODE'. Use auto, always ou off."
+      exit 1
+      ;;
+  esac
+
+  case "$SAIL_MODE" in
+    auto|on|off) ;;
+    *)
+      fail "Valor invalido para BC_HARNESS_SAIL: '$SAIL_MODE'. Use auto, on ou off."
       exit 1
       ;;
   esac

@@ -173,6 +173,10 @@ First rule that resolves wins: `--test-cmd` → `RALPH_TEST_CMD` → manifest de
 
 Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail test`); stopped containers abort at preflight — every gate 2 would fail and burn fix cycles for nothing.
 
+A project only counts as Sail when it has the package (`vendor/bin/sail` or `laravel/sail` in `composer.json`) **and** a compose file at the root (`compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`) or `SAIL_FILES`/`COMPOSE_FILE` set in the environment or in `.env`. The package alone proves nothing: the Laravel skeleton ships it in `require-dev` even for projects that run on the host. The same rule applies to the `sail-guard.sh` hook, which blocks `php`, `artisan`, `composer` and `vendor/bin/*` on the host in Sail projects.
+
+`BC_HARNESS_SAIL` overrides detection in both scripts: `auto` (default), `on` (the package is enough — e.g. compose in a parent directory) or `off` (never treat as Sail). For the hook, set it in Claude Code's environment (e.g. `"env"` in `.claude/settings.local.json`), not in the command.
+
 ### Options and variables
 
 | Option | Effect |
@@ -188,6 +192,7 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 | Variable | Effect |
 |---|---|
 | `RALPH_TEST_CMD` | Test command (gate 2) |
+| `BC_HARNESS_SAIL` | Laravel Sail detection: `auto` (default) \| `on` \| `off` |
 | `RALPH_VERIFY` | Gate 3: `always` (default) \| `auto` (saves tokens: only when gate 2's verdict isn't enough) \| `off` |
 | `RALPH_VERIFY_MODEL` | Verifier model (claude default: `sonnet`) |
 | `RALPH_MAX_CYCLES` | Fix cycles per phase (default: 3) |
@@ -313,6 +318,8 @@ scripts/
   ralph.sh                     phase-by-phase execution orchestrator
   ralph-watch.sh               live run panel (reads .phases/state/)
   test-ralph.sh                red/green suite for ralph with a mock engine
+  sail-guard.sh                PreToolUse hook: blocks host PHP/DB in Sail projects
+  test-sail-guard.sh           red/green suite for sail-guard
   check-init-drift.sh          guards against textual drift of the rules
                                duplicated across the init commands
   check-shell.sh               bash -n + shellcheck over scripts/*.sh
@@ -325,6 +332,7 @@ docs/plans/                    internal hardening plans for the harness
 scripts/test-ralph.sh        # ralph.sh suite — fake `claude`/`codex` binaries
                              # on PATH, zero network, zero tokens; exit 0 = green
 scripts/test-ralph.sh <case> # run a single case
+scripts/test-sail-guard.sh   # sail-guard.sh hook suite (needs jq)
 scripts/check-shell.sh       # bash -n over all scripts + shellcheck when available
 scripts/check-init-drift.sh  # verbatim anchors for the shared init:* rules
 ```

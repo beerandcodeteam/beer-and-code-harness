@@ -2,7 +2,9 @@
 #
 # sail-guard.sh — hook PreToolUse (Bash) do bc-harness.
 #
-# Se o projeto atual usa Laravel Sail (vendor/bin/sail presente), bloqueia
+# Se o projeto atual usa Laravel Sail (vendor/bin/sail presente E um arquivo de
+# compose para ele subir — o pacote sozinho vem no esqueleto do Laravel e nao
+# prova nada), bloqueia
 # comandos que rodariam PHP/DB no host — onde geralmente nao ha PHP instalado
 # ou o banco/redis so existe dentro do container — e devolve ao agente o
 # comando equivalente via Sail. Evita o loop de "php artisan migrate" falhando
@@ -11,8 +13,14 @@
 # Entrada: JSON do hook no stdin ({ cwd, tool_input.command, ... }).
 # Saida:   exit 0 = deixa passar; exit 2 = bloqueia (stderr vai para o agente).
 # Sem parser JSON disponivel (jq/python3), falha aberto: nao bloqueia nada.
+#
+# BC_HARNESS_SAIL sobrepoe a deteccao: auto (default) | on (exige so o
+# vendor/bin/sail) | off (nunca bloqueia). Valor desconhecido vale auto.
 
 set -u
+
+SAIL_MODE="${BC_HARNESS_SAIL:-auto}"
+[ "$SAIL_MODE" = "off" ] && exit 0
 
 INPUT="$(cat)"
 
@@ -45,6 +53,22 @@ while [ -n "$dir" ] && [ "$dir" != "/" ]; do
   dir=$(dirname "$dir")
 done
 [ -z "$SAIL_ROOT" ] && exit 0
+
+# --- sem compose o sail nao sobe nada: o projeto roda no host (mesma regra do
+# detect_sail do ralph.sh). O sail le SAIL_FILES do ambiente ou do .env do
+# projeto; o docker compose le COMPOSE_FILE idem.
+sail_has_compose() {
+  local root="$1" f
+  for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    [ -f "$root/$f" ] && return 0
+  done
+  [ -n "${SAIL_FILES:-}" ] || [ -n "${COMPOSE_FILE:-}" ] && return 0
+  [ -f "$root/.env" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?(SAIL_FILES|COMPOSE_FILE)=("[^"]+"|'"'"'[^'"'"']+'"'"'|[^[:space:]#"'"'"'])' "$root/.env"
+}
+
+if [ "$SAIL_MODE" != "on" ] && ! sail_has_compose "$SAIL_ROOT"; then
+  exit 0
+fi
 
 # --- quebra o comando em segmentos (&&, ||, |, ; e quebras de linha)
 SEGMENTS=$(printf '%s' "$CMD" | tr '\n' ';' | sed 's/&&/;/g; s/||/;/g; s/|/;/g')
@@ -89,10 +113,12 @@ done
 [ -z "$OFFENDER" ] && exit 0
 
 cat >&2 << EOF
-BLOQUEADO pelo sail-guard: este projeto usa Laravel Sail ($SAIL_ROOT/vendor/bin/sail existe).
+BLOQUEADO pelo sail-guard: este projeto usa Laravel Sail ($SAIL_ROOT/vendor/bin/sail + arquivo de compose).
 Comando "$OFFENDER" rodaria no HOST, onde PHP/banco/redis podem nao existir — e vai falhar (connection refused, php not found).
 Use o equivalente via Sail:
   $SUGGESTION
 Se os containers nao estiverem de pe, suba antes com: ./vendor/bin/sail up -d
+Se este projeto NAO roda em containers, nao contorne o bloqueio: peca ao
+desenvolvedor para definir BC_HARNESS_SAIL=off no ambiente do Claude Code.
 EOF
 exit 2
