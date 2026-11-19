@@ -83,6 +83,19 @@ if [ "$name" = "claude" ]; then
       *) shift ;;
     esac
   done
+elif [ "$name" = "opencode" ]; then
+  [ -t 0 ] || cat > /dev/null
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      run) shift ;;
+      --pure) verify=1; shift ;;
+      --model|-m) model="$2"; shift 2 ;;
+      --format) outfmt="$2"; shift 2 ;;
+      --auto) shift ;;
+      -*) shift ;;
+      *) [ -z "$prompt" ] && prompt="$1"; shift ;;
+    esac
+  done
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -163,6 +176,16 @@ case "$scenario" in
       exit 1
     fi
     ;;
+  opencode-fail)
+    echo "Error: opencode fatal error occurred" >&2
+    exit 1
+    ;;
+  opencode-limit)
+    if [ "$n" -eq 1 ]; then
+      echo "Rate limit reached. Reset in 30s." >&2
+      exit 1
+    fi
+    ;;
 esac
 
 # stall-after-red: escreve no 1o ciclo (teste vermelho), depois trava sem
@@ -210,6 +233,19 @@ if [ "$name" = "claude" ]; then
     fi
   fi
   emit_claude_ok
+elif [ "$name" = "opencode" ]; then
+  if [ "$outfmt" = "json" ]; then
+    n_tasks=$(grep -cE '^[[:space:]]*- \[[ x]\]' <<< "$prompt")
+    [ "$n_tasks" -eq 0 ] && n_tasks=1
+    for i in $(seq 1 "$n_tasks"); do
+      echo '{"type":"step_start"}'
+      echo "{\"type\":\"tool_use\",\"part\":{\"type\":\"tool\",\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"task $i\"}}}"
+      echo "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"RALPH-TASK $i START\nRALPH-TASK $i DONE\"}}"
+      echo '{"type":"step_finish"}'
+    done
+  else
+    echo "Done."
+  fi
 else
   echo "Done."
 fi
@@ -219,6 +255,7 @@ MOCK
   chmod +x "$bin/mock-engine"
   cp "$bin/mock-engine" "$bin/claude"
   cp "$bin/mock-engine" "$bin/codex"
+  cp "$bin/mock-engine" "$bin/opencode"
 }
 
 make_testcmd() {
@@ -1376,6 +1413,52 @@ if case_enabled watch-frame; then
     ok "tmux ausente — integracao do quadro pulada"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+header "38. OpenCode — execucao completa com sucesso (caminho feliz)"
+# ---------------------------------------------------------------------------
+d=$(new_case opencode-ok)
+rc=$(run_ralph "$d" ok --engine opencode --test-cmd "$d/test.sh")
+
+assert_eq "$rc" "0" "exit 0"
+commits=$(git -C "$d/repo" rev-list --count HEAD)
+assert_eq "$commits" "3" "2 commits de fase (1 fixture + 2)"
+assert_contains "$d/repo/.phases/.progress" "phase-01.md" "progresso registra phase-01"
+assert_contains "$d/repo/.phases/.progress" "phase-02.md" "progresso registra phase-02"
+assert_eq "$(cat "$d/state/impl_calls")" "2" "1 sessao de implementacao por fase (2 fases)"
+assert_eq "$(cat "$d/state/verify_calls")" "2" "gate 3 rodou em toda fase com opencode"
+
+# ---------------------------------------------------------------------------
+header "39. OpenCode — falha de execucao reprova no Gate 0"
+# ---------------------------------------------------------------------------
+d=$(new_case opencode-gate0-fail)
+rc=$(run_ralph "$d" opencode-fail --engine opencode --test-cmd "$d/test.sh" --max-cycles 1)
+
+assert_eq "$rc" "1" "exit 1 (reprovado pelo gate 0)"
+commits=$(git -C "$d/repo" rev-list --count HEAD)
+assert_eq "$commits" "1" "nenhum commit criado"
+assert_contains "$d/out.log" "Gate 0 vermelho" "gate 0 reportado vermelho no log"
+assert_contains "$d/out.log" "gate 0 — engine nao concluiu" "causa reportada corretamente"
+
+# ---------------------------------------------------------------------------
+header "40. OpenCode — verificador independente respeita --verify-model"
+# ---------------------------------------------------------------------------
+d=$(new_case opencode-verify-model)
+rc=$(run_ralph "$d" ok --engine opencode --verify-model "custom/verifier-model" --test-cmd "$d/test.sh")
+
+assert_eq "$rc" "0" "exit 0"
+assert_eq "$(cat "$d/state/verify_model")" "custom/verifier-model" "--verify-model repassado ao opencode"
+
+# ---------------------------------------------------------------------------
+header "41. OpenCode — limite de taxa retoma execucao"
+# ---------------------------------------------------------------------------
+d=$(new_case opencode-limit)
+rc=$(run_ralph "$d" opencode-limit --engine opencode --test-cmd "$d/test.sh" --max-cycles 1)
+
+assert_eq "$rc" "0" "exit 0 (limite nao consome ciclo e retoma)"
+commits=$(git -C "$d/repo" rev-list --count HEAD)
+assert_eq "$commits" "3" "fases commitadas apos a espera"
+assert_contains "$d/out.log" "Limite de uso atingido" "limite detectado no output do opencode"
 
 # ---------------------------------------------------------------------------
 echo ""

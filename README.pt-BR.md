@@ -1,6 +1,11 @@
 # Beer and Code Harness (`bc-harness`)
 
-Plugin de [Claude Code](https://claude.com/claude-code) com comandos, agentes e scripts para levar um projeto da ideia à implementação de forma estruturada: especificação formal, planejamento em fases e execução autônoma com validação mecânica — sem abrir mão do controle humano nos pontos de decisão.
+Harness para desenvolvedores com comandos, agentes e scripts para levar um projeto da ideia à implementação de forma estruturada: especificação formal, planejamento em fases e execução autônoma com validação mecânica — sem abrir mão do controle humano nos pontos de decisão.
+
+Oferece suporte a três engines:
+- **Codex** (padrão no Ralph)
+- **Claude Code**
+- **OpenCode**
 
 O harness é **agnóstico de stack**: quem define linguagem, framework, comandos e convenções são os documentos do próprio projeto (`AGENTS.md`, `CLAUDE.md`, cadeia `.spec/`), nunca o harness.
 
@@ -36,7 +41,8 @@ Transversal a tudo: **`/ai-context`** mantém a árvore de contexto (`AGENTS.md`
 
 ## Instalação
 
-O repositório é um plugin de Claude Code (`.claude-plugin/plugin.json`). Instale via marketplace/caminho local conforme sua configuração de plugins:
+### Claude Code
+O repositório funciona como plugin de Claude Code (`.claude-plugin/plugin.json`). Instale via marketplace/caminho local conforme sua configuração de plugins:
 
 ```
 /plugin install bc-harness
@@ -44,12 +50,16 @@ O repositório é um plugin de Claude Code (`.claude-plugin/plugin.json`). Insta
 
 Os comandos ficam disponíveis com namespace: `/bc-harness:init`, `/bc-harness:plan`, etc. (nesta documentação, abreviados sem o namespace).
 
+### OpenCode
+O repositório disponibiliza configuração nativa para OpenCode (`opencode.json` e `.opencode/`). Comandos customizados (`/init`, `/plan`, `/ai-context`, etc.) e agentes especializados (`planner`, `specifier`, `clarifier`, etc.) são carregados automaticamente quando executados na raiz deste repositório ou quando referenciados no seu projeto OpenCode.
+
 O `ralph.sh` é um script bash independente — copie ou referencie `scripts/ralph.sh` e rode direto no repositório do projeto-alvo.
 
 **Pré-requisitos do ralph.sh:**
 
 - Engine Codex: `npm install -g @openai/codex` + `OPENAI_API_KEY`
 - Engine Claude: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
+- Engine OpenCode: `curl -fsSL https://opencode.ai/install | bash` + provider/modelo configurado
 - Raiz de um repositório git com árvore de trabalho **limpa**
 
 ## Comandos
@@ -154,10 +164,10 @@ Sem argumento, resolve o input nesta ordem: `.spec/init/project-phases.md` → `
 
 | Gate | Pergunta | Como decide |
 |---|---|---|
-| 0 | O engine terminou de verdade? | claude: `is_error` no JSON de resultado; codex: exit code |
+| 0 | O engine terminou de verdade? | claude: `is_error` no JSON de resultado; codex / opencode: exit code |
 | 1 | A sessão escreveu código? | Assinatura da árvore antes/depois. **Sinal, não veredito** — fase já implementada faz o engine (corretamente) não escrever nada; o sinal alimenta a causa do ciclo de correção |
 | 2 | A suite de testes passa? | Rodada **pelo ralph**, fora da sessão do agente — o agente não pode "mentir verde" |
-| 3 | Cada task está de fato no código? | Sessão verificadora independente, read-only, que emite `TASK <n>: DONE/INCOMPLETE` por task. Roda em toda fase por default (`RALPH_VERIFY=always`); no engine claude usa modelo barato (`sonnet`) |
+| 3 | Cada task está de fato no código? | Sessão verificadora independente, read-only, que emite `TASK <n>: DONE/INCOMPLETE` por task. Roda em toda fase por default (`RALPH_VERIFY=always`); suporta `--verify-model` (default no claude: `sonnet`) |
 
 Qualquer gate vermelho → **ciclo de correção**: sessão nova recebe a fase inteira + a causa real da falha (nunca "os testes falharam" genérico). Default: 3 ciclos por fase.
 
@@ -173,11 +183,12 @@ Projeto Laravel Sail: a suite roda **dentro do container** (`vendor/bin/sail tes
 
 | Opção | Efeito |
 |---|---|
-| `--engine codex\|claude` | Engine de implementação (default: `codex`) |
+| `--engine codex\|claude\|opencode` | Engine de implementação (default: `codex`) |
 | `--from N` | Começa na fase N (limpa o progresso das fases ≥ N) |
 | `--keep-going` | Continua após fase falhar (cria commit `wip(phase-N)`; default: para) |
 | `--max-cycles N` | Ciclos de correção por fase (default: 3) |
 | `--test-cmd "<cmd>"` | Comando de teste do projeto (gate 2) |
+| `--verify-model "<model>"` | Sobrescreve o modelo do verificador no gate 3 |
 | `--no-verify` | Desliga o gate 3 |
 | `--dashboard` | Painel ao vivo no terminal (ver abaixo) |
 
@@ -223,11 +234,14 @@ O ralph publica o estado do run em `.phases/state/` **sempre**, com ou sem `--da
 
 ### De onde vem o progresso por task
 
-Uma fase é **uma** sessão de agente, então o ralph não teria como saber onde a sessão está — a menos que a sessão conte. No engine claude ela conta:
+Uma fase é **uma** sessão de agente, então o ralph não teria como saber onde a sessão está — a menos que a sessão conte. Nos engines **claude** e **opencode** ela conta:
 
-A sessão roda com `--output-format stream-json`, que emite eventos linha a linha **enquanto** trabalha. O ralph lê esse stream e reescreve o progresso em `.phases/state/live.tsv`, de quatro fontes, nesta ordem de precedência:
+- **Claude**: roda com `--output-format stream-json`
+- **OpenCode**: roda com `--format json`
 
-1. **Marcadores de texto** (fonte primária). O prompt manda o agente escrever, como linha isolada, `RALPH-TASK <n> START` antes de começar o item *n* e `RALPH-TASK <n> DONE` quando ele estiver pronto. É texto puro: **não depende de ferramenta nenhuma** — e isso é o que importa, porque em sessão headless (`claude -p`) as ferramentas de lista de tarefas simplesmente não existem, mesmo que o agente tente carregá-las com `ToolSearch`.
+Ambos emitem eventos linha a linha **enquanto** trabalham. O ralph lê esse stream e reescreve o progresso em `.phases/state/live.tsv`, de quatro fontes, nesta ordem de precedência:
+
+1. **Marcadores de texto** (fonte primária). O prompt manda o agente escrever, como linha isolada, `RALPH-TASK <n> START` antes de começar o item *n* e `RALPH-TASK <n> DONE` quando ele estiver pronto. É texto puro: **não depende de ferramenta nenhuma** — e isso é o que importa, porque em sessão headless (`claude -p` ou `opencode run`) as ferramentas de lista de tarefas simplesmente não existem, mesmo que o agente tente carregá-las com `ToolSearch`.
 2. **Lista de tarefas do agente**, quando a sessão tiver uma (`TaskCreate`/`TaskUpdate` ou `TodoWrite`): as transições `in_progress`/`completed` viram progresso.
 3. **Reserva observacional** — sem marcador e sem lista, o ralph deduz pelo que o agente edita. Um plano do `/plan` declara `Arquivos:` em cada item, e é esse casamento (caminho editado ↔ arquivo declarado pela task) que dá a granularidade; sem a declaração, cai no enunciado da task. Ao entrar numa task, as anteriores contam como concluídas — o agente trabalha em ordem, e nem toda task tem arquivo próprio.
 4. **Sinal de vida**: assim que a sessão abre, a task 1 aparece em execução — nunca uma fase inteira parada em "Pendente".
@@ -296,7 +310,9 @@ Os dois writers de `/ai-context` rodam em paralelo (arquivos disjuntos, digest r
 ## Estrutura do repositório
 
 ```
-.claude-plugin/plugin.json     manifest do plugin
+.claude-plugin/plugin.json     manifest do plugin de Claude Code
+opencode.json                  schema de configuracao do OpenCode
+.opencode/                     comandos, agentes e plugins do OpenCode
 commands/
   init.md                      /init (roteador diagnóstico)
   init/                        /init:project-description, user-stories,
@@ -308,7 +324,7 @@ agents/                        specifier, clarifier, planner,
 scripts/
   ralph.sh                     orquestrador de execução por fases
   ralph-watch.sh               painel ao vivo do run (lê .phases/state/)
-  test-ralph.sh                suite red/green do ralph com engine mock
+  test-ralph.sh                suite red/green do ralph com engines mock
   check-init-drift.sh          guarda contra drift textual das regras
                                duplicadas nos comandos init
   check-shell.sh               bash -n + shellcheck em scripts/*.sh
@@ -318,7 +334,7 @@ docs/plans/                    planos de hardening internos do harness
 ## Desenvolvimento
 
 ```bash
-scripts/test-ralph.sh        # suite do ralph.sh — binários fake `claude`/`codex`
+scripts/test-ralph.sh        # suite do ralph.sh — binários fake `claude`/`codex`/`opencode`
                              # no PATH, zero rede, zero token; exit 0 = verde
 scripts/test-ralph.sh <caso> # roda um caso específico
 scripts/check-shell.sh       # bash -n em todos os scripts + shellcheck se disponível

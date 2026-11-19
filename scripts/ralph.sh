@@ -22,7 +22,7 @@
 #   ./ralph.sh [opcoes] [caminho-do-arquivo]
 #
 # Opcoes:
-#   --engine codex|claude    engine de implementacao (default: codex)
+#   --engine codex|claude|opencode  engine de implementacao (default: codex)
 #   --from N                 comeca na fase N (limpa do progresso as fases >= N)
 #   --keep-going             continua apos uma fase falhar (default: para)
 #   --max-cycles N           ciclos de correcao por fase (default: 3)
@@ -98,7 +98,7 @@
 #   RALPH_LIMIT_BUFFER       segundos extras apos o reset (default: 60)
 #
 # Exportadas para hooks (ex: notify-n8n.sh) durante cada sessao de engine:
-#   RALPH_ENGINE             codex | claude
+#   RALPH_ENGINE             codex | claude | opencode
 #   RALPH_PHASE_TITLE        titulo da fase corrente
 #   RALPH_PHASE_NUM          numero da fase corrente
 #   RALPH_PHASE_TOTAL        total de fases do run
@@ -110,6 +110,7 @@
 # Pre-requisitos:
 #   - Codex: npm install -g @openai/codex + OPENAI_API_KEY
 #   - Claude: npm install -g @anthropic-ai/claude-code + ANTHROPIC_API_KEY
+#   - OpenCode: curl -fsSL https://opencode.ai/install | bash
 #   - Raiz de um repo git, com a arvore de trabalho limpa
 
 set -euo pipefail
@@ -134,6 +135,8 @@ while [[ $# -gt 0 ]]; do
     --max-cycles=*) MAX_CYCLES="${1#*=}"; shift ;;
     --test-cmd)    TEST_CMD_FLAG="$2"; shift 2 ;;
     --test-cmd=*)  TEST_CMD_FLAG="${1#*=}"; shift ;;
+    --verify-model) VERIFY_MODEL="$2"; shift 2 ;;
+    --verify-model=*) VERIFY_MODEL="${1#*=}"; shift ;;
     --keep-going)  KEEP_GOING=true; shift ;;
     --no-verify)   VERIFY_MODE="off"; shift ;;
     --dashboard)   DASHBOARD=true; shift ;;
@@ -391,8 +394,8 @@ resolve_test_cmd() {
 }
 
 preflight_checks() {
-  if [[ "$ENGINE" != "codex" && "$ENGINE" != "claude" ]]; then
-    fail "Engine invalida: $ENGINE. Use 'codex' ou 'claude'."
+  if [[ "$ENGINE" != "codex" && "$ENGINE" != "claude" && "$ENGINE" != "opencode" ]]; then
+    fail "Engine invalida: $ENGINE. Use 'codex', 'claude' ou 'opencode'."
     exit 1
   fi
 
@@ -415,18 +418,22 @@ preflight_checks() {
   esac
 
   # Verificacao e leitura + checklist: nao precisa do modelo de implementacao.
-  # No codex nao ha default seguro de modelo barato — so aplica se pedido.
-  if [ -n "${RALPH_VERIFY_MODEL:-}" ]; then
-    VERIFY_MODEL="$RALPH_VERIFY_MODEL"
-  elif [[ "$ENGINE" == "claude" ]]; then
-    VERIFY_MODEL="sonnet"
+  # No codex e opencode nao ha default seguro de modelo barato — so aplica se pedido.
+  if [ -z "$VERIFY_MODEL" ]; then
+    if [ -n "${RALPH_VERIFY_MODEL:-}" ]; then
+      VERIFY_MODEL="$RALPH_VERIFY_MODEL"
+    elif [[ "$ENGINE" == "claude" ]]; then
+      VERIFY_MODEL="sonnet"
+    fi
   fi
 
   if ! command -v "$ENGINE" &> /dev/null; then
     if [[ "$ENGINE" == "codex" ]]; then
       fail "codex CLI nao encontrado. Instale com: npm install -g @openai/codex"
-    else
+    elif [[ "$ENGINE" == "claude" ]]; then
       fail "Claude Code CLI nao encontrado. Instale com: npm install -g @anthropic-ai/claude-code"
+    else
+      fail "OpenCode CLI nao encontrado. Instale com: curl -fsSL https://opencode.ai/install | bash"
     fi
     exit 1
   fi
@@ -1002,20 +1009,21 @@ stream_watch() {
       # --- atividade corrente ----------------------------------------------
       *'"type":"tool_use"'*)
         tool=$(json_str "$line" name) || tool=""
-        case "$tool" in
-          Bash)
-            val=$(json_text "$line" description) || val=$(json_text "$line" command) || val=""
+        [ -z "$tool" ] && tool=$(json_str "$line" tool) || true
+        case "${tool,,}" in
+          bash)
+            val=$(json_text "$line" description) || val=$(json_text "$line" title) || val=$(json_text "$line" command) || val=""
             activity="bash: ${val:0:60}"
             ;;
-          Edit|Write|NotebookEdit)
-            val=$(json_str "$line" file_path) || val=""
+          edit|write|notebookedit)
+            val=$(json_str "$line" file_path) || val=$(json_str "$line" path) || val=""
             activity="$tool: $(basename -- "${val:-?}")"
             [ -n "$val" ] && sw_infer_from_file "$val"
             ;;
-          Read|Glob|Grep)
+          read|glob|grep)
             activity="lendo o projeto ($tool)"
             ;;
-          ToolSearch|"") ;;
+          toolsearch|"") ;;
           *) activity="$tool" ;;
         esac
         sw_flush
@@ -1065,9 +1073,9 @@ PREAMBLE
 # O painel acompanha a fase task a task lendo as transicoes da lista de tarefas
 # do agente no stream. Sem este bloco o ralph so sabe "fase em execucao" e o
 # progresso por task fica parado ate o gate 3.
-# So faz sentido no claude: o codex nao expoe um stream equivalente.
+# Faz sentido no claude e opencode: o codex nao expoe um stream equivalente.
 task_protocol_block() {
-  [[ "$ENGINE" == "claude" ]] || return 0
+  [[ "$ENGINE" == "claude" || "$ENGINE" == "opencode" ]] || return 0
   cat <<'PROTO'
 
 ## Protocolo de progresso (obrigatorio)
@@ -1341,6 +1349,21 @@ run_engine() {
         codex exec --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
       else
         codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
+      fi
+    elif [[ "$ENGINE" == "opencode" ]]; then
+      # < /dev/null: garante que o CLI nao consome o stream de quem chamou.
+      if [[ "$mode" == "verify" ]]; then
+        opencode run "$(cat "$prompt_file")" --pure "${model_args[@]}" < /dev/null 2>&1 | tee "$log_file" || rc=$?
+      else
+        local quiet=0
+        $DASHBOARD && quiet=1
+        if opencode run "$(cat "$prompt_file")" --auto --format json < /dev/null 2>&1 \
+             | tee "$log_file" \
+             | stream_watch "$LIVE_STATE" "${RALPH_PHASE_NUM:-0}" "$quiet" "$CURRENT_PHASE_FILE"; then
+          rc=0
+        else
+          rc=$?
+        fi
       fi
     else
       # < /dev/null: claude -p le stdin quando nao e TTY. Sem o redirect ele
