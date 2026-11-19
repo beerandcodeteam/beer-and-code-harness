@@ -2,7 +2,7 @@
 description: Read the project description and user stories, then derive a suggested database schema in DBML at .spec/init/database-schema.md
 ---
 
-# init:database-schema
+# init-database-schema
 
 You are helping a developer turn a **project description** and its **user stories** into a **suggested database schema** written in **DBML** (Database Markup Language). This document is the third artifact of the project spec. It builds directly on the first two and becomes the reference the team uses to write migrations and models.
 
@@ -27,7 +27,7 @@ Read the existing project description and user stories, then produce a single do
 
 Before asking anything, read **`.spec/init/project-description.md`** and **`.spec/init/user-stories.md`**. These are the inputs to this command.
 
-- If either file is missing, stop and tell the developer to run `init:project-description` and/or `init:user-stories` first.
+- If either file is missing, stop and tell the developer to run `init-project-description` and/or `init-user-stories` first.
 - Extract: the core concepts (the nouns → tables), the workflows and stories (the fields, states, and relationships), the user types (auth/roles), and any limits or numbers stated (→ column constraints).
 - Extract the **framework and ORM** from the project description's Tech Stack section — they drive the naming conventions below. Confirm against the codebase manifest (`composer.json`, `package.json`, `pyproject.toml`, `go.mod`, `Gemfile`, …) when one exists.
 - Also scan any other files already under `.spec/` for schema decisions already made, and inspect the project for an existing schema (migrations directory, ORM models/entities, `schema.prisma`, `*.sql` files) so you extend rather than contradict what's there.
@@ -44,7 +44,7 @@ for pair in $(sed -n '3p' .spec/init/user-stories.md | grep -oE '[a-z0-9.-]+\.md
 done
 ```
 
-Any output → warn the developer ("input changed after this artifact was generated — review before proceeding") and suggest re-running `init:user-stories` first. Warn and proceed if the developer chooses; never block. A file without a line-3 stamp predates this mechanism — nothing to verify.
+Any output → warn the developer ("input changed after this artifact was generated — review before proceeding") and suggest re-running `init-user-stories` first. Warn and proceed if the developer chooses; never block. A file without a line-3 stamp predates this mechanism — nothing to verify.
 
 ### If the target file already exists (re-run)
 
@@ -77,7 +77,7 @@ Derive as much of the schema as you can directly from the docs, then find what's
 - **Categorical fields** — every status/type/category/priority/role → which values seed the lookup table.
 - **Uniqueness & required fields** — which columns are `unique`, which are `not null`.
 
-Use `AskUserQuestion` for discrete decisions with clear options. Ask real open questions in plain text when the answer is not a menu. Batch related questions; don't drip one at a time. When something stays undecided, mark it as an open question rather than inventing a column.
+Use `question` for discrete decisions with clear options. Ask real open questions in plain text when the answer is not a menu. Batch related questions; don't drip one at a time. When something stays undecided, mark it as an open question rather than inventing a column.
 
 ### 3. Write the document
 

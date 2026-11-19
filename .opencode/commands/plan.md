@@ -14,9 +14,9 @@ Produce a complete plan — formal SPEC (GEARS RIGID/FLEXIBLE), resolved clarifi
 
 | Step | Agent | Artifact |
 |---|---|---|
-| §5 | `bc-harness:specifier` | `.spec/features/[slug]/SPEC.md` |
-| §6 (conditional) | `bc-harness:clarifier` | `SPEC.md` updated in-place |
-| §7 | `bc-harness:planner` | `.spec/features/[slug]/PLAN.md` + `PHASES.md` (view executável pelo `ralph.sh`) + optional `openapi.yaml` / `service.proto` / `asyncapi.yaml` |
+| §5 | `specifier` | `.spec/features/[slug]/SPEC.md` |
+| §6 (conditional) | `clarifier` | `SPEC.md` updated in-place |
+| §7 | `planner` | `.spec/features/[slug]/PLAN.md` + `PHASES.md` (view executável pelo `ralph.sh`) + optional `openapi.yaml` / `service.proto` / `asyncapi.yaml` |
 
 ## Input — `$ARGUMENTS`
 
@@ -83,7 +83,7 @@ Present `summary`, the ACs (drafted ones flagged), `slug`, and `tier`. The devel
 
 1. `AGENTS.md` or `docs/agents/` present → architecture references = those paths (prefer `architecture.md` + `domain_rules.md`).
 2. Absent but `.github/copilot-instructions.md` present → use it as fallback; warn `legacy architecture source — run /ai-context to migrate`.
-3. Neither → AskUserQuestion: "AGENTS context tree not found. Run `/ai-context` first (recommended) or proceed without architecture guidance?" Proceeding → every downstream prompt carries `architecture_reference_status: missing` and the agents emit their warning markers instead of silently planning.
+3. Neither → question: "AGENTS context tree not found. Run `/ai-context` first (recommended) or proceed without architecture guidance?" Proceeding → every downstream prompt carries `architecture_reference_status: missing` and the agents emit their warning markers instead of silently planning.
 
 ### 5 — Delegate to `specifier`
 
@@ -107,7 +107,7 @@ Run when `grep -c '\[NEEDS CLARIFICATION\]' SPEC.md` > 0, OR tier is `complete`,
 Two-phase — the subagent never talks to the developer; you do:
 
 1. **analyze** — clarifier reads the SPEC and returns prioritized questions (no edits).
-2. You present the questions to the developer (AskUserQuestion, one batch) and collect answers.
+2. You present the questions to the developer (question tool, one batch) and collect answers.
 3. **resolve** — re-invoke clarifier with the answers (inline when short; otherwise write `.spec/features/[slug]/.handoff/clarifier-answers.md` and pass the path). It updates the SPEC in-place and increments the version.
 
 Verify after resolve: `grep -c '\[NEEDS CLARIFICATION\]'` — remaining markers → warn the developer explicitly before continuing.
@@ -163,7 +163,7 @@ Closing lines: unresolved markers count (when > 0), then the execution handoff �
 ## Rules
 
 - **Thin router** — no SPEC/PLAN template content in this file; agents own the shapes.
-- **Delegate plugin-namespaced** (`bc-harness:specifier`, `bc-harness:clarifier`, `bc-harness:planner`), never bare.
+- **Delegate by exact agent name** (`specifier`, `clarifier`, `planner`) — OpenCode has no plugin namespace; use the names listed by the Task tool.
 - **Never write application code.** The pipeline writes only under `.spec/features/[slug]/` (router itself only under `.handoff/`).
 - **No issue tracker** — the confirmed description + ACs are the source of truth; never invent an external reference.
 - Scope grows mid-planning → stop, propose splitting into smaller features and re-running `/plan` per slice.

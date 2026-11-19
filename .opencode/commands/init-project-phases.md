@@ -2,7 +2,7 @@
 description: Read the project description, user stories, database schema, and any design specs, then plan the build into numbered, agent-ready phases with tasks, acceptance criteria, and feature tests at .spec/init/project-phases.md
 ---
 
-# init:project-phases
+# init-project-phases
 
 **ultrathink.** This is a high-stakes planning task: the document you produce is fed to AI agents that build the whole project from it. Engage your maximum reasoning budget. Do not rush. Precision, completeness, and faithful coverage of every source document matter more than brevity.
 
@@ -92,7 +92,7 @@ Derive as much of the plan as you can directly from the docs, then ask the devel
 - **Ambiguous scope** — flows implied but not fully specified in the stories.
 - **Design coverage** — screens with no design reference: build to a sensible default, or wait for design?
 
-Use `AskUserQuestion` for discrete decisions with clear options. Ask real open questions in plain text when the answer is not a menu. Batch related questions; don't drip one at a time. When something stays undecided, mark it as an open question rather than inventing scope.
+Use `question` for discrete decisions with clear options. Ask real open questions in plain text when the answer is not a menu. Batch related questions; don't drip one at a time. When something stays undecided, mark it as an open question rather than inventing scope.
 
 ## Rules for phasing
 

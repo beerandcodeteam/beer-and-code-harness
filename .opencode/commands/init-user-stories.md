@@ -2,7 +2,7 @@
 description: Read the project description and derive structured, testable user stories at .spec/init/user-stories.md
 ---
 
-# init:user-stories
+# init-user-stories
 
 You are helping a developer turn a **project description** into a set of **clear, testable user stories**. This document is the second artifact of the project spec. It builds directly on the project description and becomes the backlog the team plans and builds from.
 
@@ -27,7 +27,7 @@ Read the existing project description and produce a single document at **`.spec/
 
 Before asking anything, read **`.spec/init/project-description.md`**. This is the input to this command.
 
-- If the file is missing, stop and tell the developer to run `init:project-description` first.
+- If the file is missing, stop and tell the developer to run `init-project-description` first.
 - Extract from it: the user types, core concepts, core workflows, tech stack constraints, and the MVP boundary.
 - Also scan any other files already under `.spec/` for decisions already made.
 
@@ -64,7 +64,7 @@ Derive as many stories as you can directly from the description, then find what'
 - **Acceptance edge cases** — limits, states, failure paths that make a story testable.
 - **Missing flows** — anything implied by the concepts/workflows but not yet a story.
 
-Use `AskUserQuestion` for discrete decisions with clear options (e.g. priority, in/out of MVP). Ask real open questions in plain text when the answer is not a menu. Batch related questions; don't drip one at a time. When something stays undecided, mark it as an open question rather than inventing an answer.
+Use `question` for discrete decisions with clear options (e.g. priority, in/out of MVP). Ask real open questions in plain text when the answer is not a menu. Batch related questions; don't drip one at a time. When something stays undecided, mark it as an open question rather than inventing an answer.
 
 ### 3. Write the document
 

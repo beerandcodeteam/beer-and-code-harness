@@ -74,7 +74,7 @@ Fails → abort with `Target <path> is not a git repository — aborting.` Write
 
 ### 3 — Inspect (delegate to `ai-context-inspector`)
 
-Spawn the `ai-context-inspector` agent (plugin-namespaced, e.g. `bc-harness:ai-context-inspector`) with the target path. It returns the structured digest: stack, verbatim commands, layout, dependency list, API/async/persistence signals, domain signals, legacy seeds, and the ownership classification of all 10 canonical paths.
+Spawn the `ai-context-inspector` agent (exact name as listed by the Task tool — OpenCode has no plugin namespace) with the target path. It returns the structured digest: stack, verbatim commands, layout, dependency list, API/async/persistence signals, domain signals, legacy seeds, and the ownership classification of all 10 canonical paths.
 
 Hold the digest for step 4. Do not re-inspect the repo yourself.
 

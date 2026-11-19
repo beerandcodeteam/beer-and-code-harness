@@ -2,7 +2,7 @@
 description: Interview the developer, discover the stack, and produce a structured project description at .spec/init/project-description.md
 ---
 
-# init:project-description
+# init-project-description
 
 You are helping a developer turn a rough idea into a **clear, structured project description**. 
 This document is the first artifact of the project spec. It is written *before* code and becomes the shared source 
@@ -56,7 +56,7 @@ Understand the idea, then find what's undefined. Ask the developer about the gap
 - **Core workflows** — the main flows, step by step.
 - **Constraints** — auth model, integrations, platform, non-goals.
 
-Use `AskUserQuestion` for discrete decisions with clear options. Ask real open questions in plain text when the answer is not a menu. Batch related questions; don't drip one at a time. Keep going until you can write each section without hand-waving. When something stays undecided, mark it explicitly as an open question rather than inventing an answer.
+Use `question` for discrete decisions with clear options. Ask real open questions in plain text when the answer is not a menu. Batch related questions; don't drip one at a time. Keep going until you can write each section without hand-waving. When something stays undecided, mark it explicitly as an open question rather than inventing an answer.
 
 ### 3. Write the document
 
