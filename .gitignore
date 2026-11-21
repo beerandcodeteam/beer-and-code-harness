@@ -16,3 +16,8 @@ mira-templates/
 .mira/
 CLAUDE.md
 mira.config.json
+
+# OpenCode runtime
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
