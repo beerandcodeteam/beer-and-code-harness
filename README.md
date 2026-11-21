@@ -2,7 +2,12 @@
 
 > 🇧🇷 [Documentação em português](README.pt-BR.md)
 
-A [Claude Code](https://claude.com/claude-code) plugin with commands, agents, and scripts that take a project from idea to implementation in a structured way: formal specification, phased planning, and autonomous execution with mechanical validation — while keeping a human in control at every decision point.
+A developer harness with commands, agents, and scripts that take a project from idea to implementation in a structured way: formal specification, phased planning, and autonomous execution with mechanical validation — while keeping a human in control at every decision point.
+
+Supports three engines:
+- **Codex** (default in Ralph)
+- **Claude Code**
+- **OpenCode**
 
 The harness is **stack-agnostic**: language, framework, commands, and conventions are defined by the project's own documents (`AGENTS.md`, `CLAUDE.md`, the `.spec/` chain), never by the harness.
 
@@ -38,7 +43,8 @@ Cross-cutting: **`/ai-context`** keeps the context tree (`AGENTS.md`, `CLAUDE.md
 
 ## Installation
 
-This repository is a Claude Code plugin (`.claude-plugin/plugin.json`). Install it via marketplace/local path according to your plugin setup:
+### Claude Code
+This repository functions as a Claude Code plugin (`.claude-plugin/plugin.json`). Install it via marketplace/local path according to your plugin setup:
 
 ```
 /plugin install bc-harness
@@ -46,12 +52,16 @@ This repository is a Claude Code plugin (`.claude-plugin/plugin.json`). Install 
 
 Commands are namespaced: `/bc-harness:init`, `/bc-harness:plan`, etc. (abbreviated without the namespace throughout this document).
 
+### OpenCode
+This repository provides native OpenCode configuration (`opencode.json` and `.opencode/`). Custom commands (`/init`, `/plan`, `/ai-context`, etc.) and specialized agents (`planner`, `specifier`, `clarifier`, etc.) are detected automatically when running inside this repository or when linked into your OpenCode project directory.
+
 `ralph.sh` is a standalone bash script — copy or reference `scripts/ralph.sh` and run it directly in the target project's repository.
 
 **ralph.sh prerequisites:**
 
 - Codex engine: `npm install -g @openai/codex` + `OPENAI_API_KEY`
 - Claude engine: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
+- OpenCode engine: `curl -fsSL https://opencode.ai/install | bash` + configured provider/model
 - Root of a git repository with a **clean** working tree
 
 ## Commands
@@ -158,10 +168,10 @@ With no argument, the input resolves in this order: `.spec/init/project-phases.m
 
 | Gate | Question | How it decides |
 |---|---|---|
-| 0 | Did the engine actually finish? | claude: `is_error` in the result JSON; codex: exit code |
+| 0 | Did the engine actually finish? | claude: `is_error` in the result JSON; codex / opencode: exit code |
 | 1 | Did the session write code? | Tree signature before/after. **A signal, not a verdict** — an already-implemented phase makes the engine (correctly) write nothing; the signal feeds the fix-cycle cause |
 | 2 | Does the test suite pass? | Run **by ralph itself**, outside the agent session — the agent cannot "fake green" |
-| 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. Runs on every phase by default (`RALPH_VERIFY=always`); on the claude engine it uses a cheap model (`sonnet`) |
+| 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. Runs on every phase by default (`RALPH_VERIFY=always`); supports `--verify-model` (claude default: `sonnet`) |
 
 Any red gate → **fix cycle**: a fresh session receives the full phase + the real failure cause (never a generic "tests failed"). Default: 3 cycles per phase.
 
@@ -177,11 +187,12 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 
 | Option | Effect |
 |---|---|
-| `--engine codex\|claude` | Implementation engine (default: `codex`) |
+| `--engine codex\|claude\|opencode` | Implementation engine (default: `codex`) |
 | `--from N` | Starts at phase N (clears progress for phases ≥ N) |
 | `--keep-going` | Continues after a phase fails (creates a `wip(phase-N)` commit; default: stop) |
 | `--max-cycles N` | Fix cycles per phase (default: 3) |
 | `--test-cmd "<cmd>"` | Project test command (gate 2) |
+| `--verify-model "<model>"` | Verifier model override for gate 3 |
 | `--no-verify` | Disables gate 3 |
 | `--dashboard` | Live panel in the terminal (see below) |
 
@@ -226,11 +237,14 @@ ralph publishes run state to `.phases/state/` **always**, with or without `--das
 
 ### Where per-task progress comes from
 
-A phase is **one** agent session, so ralph could not know where the session is — unless the session says so. On the claude engine it does:
+A phase is **one** agent session, so ralph could not know where the session is — unless the session says so. On the **claude** and **opencode** engines it does:
 
-The session runs with `--output-format stream-json`, which emits events line by line **while** it works. ralph reads that stream and rewrites progress into `.phases/state/live.tsv`, from four sources, in this order of precedence:
+- **Claude**: runs with `--output-format stream-json`
+- **OpenCode**: runs with `--format json`
 
-1. **Text markers** (primary source). The prompt tells the agent to write, as a standalone line, `RALPH-TASK <n> START` before starting item *n* and `RALPH-TASK <n> DONE` once it is ready. It is plain text: it **depends on no tool at all** — which is what matters, because in a headless session (`claude -p`) task-list tools simply do not exist, even when the agent tries to load them via `ToolSearch`.
+Both engines emit events line by line **while** they work. ralph reads that stream and rewrites progress into `.phases/state/live.tsv`, from four sources, in this order of precedence:
+
+1. **Text markers** (primary source). The prompt tells the agent to write, as a standalone line, `RALPH-TASK <n> START` before starting item *n* and `RALPH-TASK <n> DONE` once it is ready. It is plain text: it **depends on no tool at all** — which is what matters, because in a headless session (`claude -p` or `opencode run`) task-list tools simply do not exist, even when the agent tries to load them via `ToolSearch`.
 2. **The agent's task list**, when the session has one (`TaskCreate`/`TaskUpdate` or `TodoWrite`): its `in_progress`/`completed` transitions become progress.
 3. **Observational fallback** — with no marker and no list, ralph infers from what the agent edits. A `/plan` plan declares `Arquivos:` on every item, and it is that match (edited path ↔ file declared by the task) that provides the granularity; without the declaration it falls back to the task's own text. On entering a task the earlier ones count as done — the agent works in order, and not every task has a file of its own.
 4. **Sign of life**: as soon as the session opens, task 1 shows as running — never a whole phase frozen at "Pendente".
@@ -300,7 +314,9 @@ The two `/ai-context` writers run in parallel (disjoint files, read-only digest)
 ## Repository structure
 
 ```
-.claude-plugin/plugin.json     plugin manifest
+.claude-plugin/plugin.json     Claude Code plugin manifest
+opencode.json                  OpenCode configuration schema
+.opencode/                     OpenCode commands, agents, and plugins
 commands/
   init.md                      /init (diagnostic router)
   init/                        /init:project-description, user-stories,
@@ -312,7 +328,7 @@ agents/                        specifier, clarifier, planner,
 scripts/
   ralph.sh                     phase-by-phase execution orchestrator
   ralph-watch.sh               live run panel (reads .phases/state/)
-  test-ralph.sh                red/green suite for ralph with a mock engine
+  test-ralph.sh                red/green suite for ralph with mock engines
   check-init-drift.sh          guards against textual drift of the rules
                                duplicated across the init commands
   check-shell.sh               bash -n + shellcheck over scripts/*.sh
@@ -322,7 +338,7 @@ docs/plans/                    internal hardening plans for the harness
 ## Development
 
 ```bash
-scripts/test-ralph.sh        # ralph.sh suite — fake `claude`/`codex` binaries
+scripts/test-ralph.sh        # ralph.sh suite — fake `claude`/`codex`/`opencode` binaries
                              # on PATH, zero network, zero tokens; exit 0 = green
 scripts/test-ralph.sh <case> # run a single case
 scripts/check-shell.sh       # bash -n over all scripts + shellcheck when available
